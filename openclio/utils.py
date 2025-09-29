@@ -277,7 +277,7 @@ def getDuplicateFacetValues(
         facetName: str,
         conversations: List[Dict[str, str]],
         llm,  # LLMInterface
-        maxConversationTokens: int
+        maxTextChars: int
     ):
     """
     Utility method if u want to find [(facetValue, conversationIndicesOfFacetValue, allDuplicateValues)]
@@ -291,11 +291,11 @@ def getDuplicateFacetValues(
         for facetValue in conversationFacetValues.facetValues:
             if facetValue.facet.name == facetName:
                 counts[facetValue.value].append(conversationI)
-    
+
     dups = sorted([(k,vs) for (k,vs) in counts.items() if len(vs) > 1], key=lambda x: -len(x[1]))
     for k,vs in dups:
         for conversationI in vs:
-            uniques[k].add(conversationToString(conversations[conversationI], tokenizer=tokenizer, maxTokens=maxConversationTokens))
+            uniques[k].add(conversationToString(conversations[conversationI], tokenizer=tokenizer, maxTokens=maxTextChars))
     return [(k,vs,uniques[k]) for (k,vs) in dups]
 
 def runWebui(path, port):

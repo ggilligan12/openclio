@@ -137,7 +137,7 @@ def conversationToString(conversation: List[Dict[str, str]], tokenizer: Optional
 
 
 def getFacetPrompt(tokenizer, facet, conversation, cfg, tokenizerArgs):
-    conversationStr = conversationToString(conversation, tokenizer=tokenizer, maxTokens=cfg.maxConversationTokens)
+    conversationStr = conversationToString(conversation, tokenizer=tokenizer, maxTokens=cfg.maxTextChars)
     return doCachedReplacements(
         funcName="getFacetPrompt",
         tokenizer=tokenizer,
