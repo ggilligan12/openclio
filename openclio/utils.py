@@ -30,25 +30,31 @@ class KeyPoller():
 
     def __enter__(self):
         if self.noCancel: return self
-        global isWindows
-        if isWindows:
-            self.readHandle = GetStdHandle(STD_INPUT_HANDLE)
-            self.readHandle.SetConsoleMode(ENABLE_LINE_INPUT|ENABLE_ECHO_INPUT|ENABLE_PROCESSED_INPUT)
-            
-            self.curEventLength = 0
-            self.curKeysLength = 0
-            
-            self.capturedChars = []
-        else:
-            # Save the terminal settings
-            self.fd = sys.stdin.fileno()
-            self.new_term = termios.tcgetattr(self.fd)
-            self.old_term = termios.tcgetattr(self.fd)
-            
-            # New terminal setting unbuffered
-            self.new_term[3] = (self.new_term[3] & ~termios.ICANON & ~termios.ECHO)
-            termios.tcsetattr(self.fd, termios.TCSAFLUSH, self.new_term)
-            
+
+        # Check if we're in a real terminal (not Jupyter/Colab)
+        try:
+            global isWindows
+            if isWindows:
+                self.readHandle = GetStdHandle(STD_INPUT_HANDLE)
+                self.readHandle.SetConsoleMode(ENABLE_LINE_INPUT|ENABLE_ECHO_INPUT|ENABLE_PROCESSED_INPUT)
+
+                self.curEventLength = 0
+                self.curKeysLength = 0
+
+                self.capturedChars = []
+            else:
+                # Save the terminal settings
+                self.fd = sys.stdin.fileno()
+                self.new_term = termios.tcgetattr(self.fd)
+                self.old_term = termios.tcgetattr(self.fd)
+
+                # New terminal setting unbuffered
+                self.new_term[3] = (self.new_term[3] & ~termios.ICANON & ~termios.ECHO)
+                termios.tcsetattr(self.fd, termios.TCSAFLUSH, self.new_term)
+        except (OSError, IOError):
+            # Not in a real terminal (e.g., Jupyter/Colab), disable key polling
+            self.noCancel = True
+
         return self
     
     def __exit__(self, type, value, traceback):

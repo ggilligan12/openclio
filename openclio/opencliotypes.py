@@ -128,7 +128,7 @@ class OpenClioConfig:
         'top_p': 0.8,
         'top_k': 20,
         'min_p': 0.0,
-    }) #: Extra parameters to pass into vllm.SamplingParams
+    }) #: Extra parameters to pass to LLM generation (e.g., temperature, top_p, etc.)
 
     kmeansArgs: Dict[str, Any] = field(default_factory = lambda: {
         "approximate": True, # since we only have 10 elements per term, by default this would take many hours, this speeds it up a lot
