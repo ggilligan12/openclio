@@ -19,7 +19,6 @@ dependencies = [
     "concave_hull",
     "tqdm",
     "dataclasses",
-    "vllm",
     "pandas",
     "sentence_transformers",
     "numpy",
@@ -30,8 +29,12 @@ dependencies = [
     "setuptools",
     "pyarrow",
     "faiss-cpu",
-    "cryptography",
-    "numba"
+    "numba",
+    "google-cloud-aiplatform>=1.38.0",
+    "tenacity>=8.0.0",
+    "ipywidgets>=8.0.0",
+    "plotly>=5.0.0",
+    "pydantic>=2.0.0",
 ]
 dynamic = ["version"]
 

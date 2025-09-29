@@ -27,16 +27,25 @@ class FacetValue:
 
 @dataclass
 class ConversationFacetData:
-    conversation: List[Any]
+    """Facet data for a single data point (text or conversation)"""
+    conversation: Any  # Can be str (text) or List[Dict] (conversation) for backwards compat
     facetValues: List[FacetValue]
+
+# Alias for clearer naming with text data
+DataPointFacetData = ConversationFacetData
 
 @dataclass
 class ConversationEmbedding:
-    conversation: List[Any]
+    """Embedding for a single data point"""
+    conversation: Any  # Can be str (text) or List[Dict] (conversation)
     embedding: Any
-    
+
+# Alias for clearer naming
+DataPointEmbedding = ConversationEmbedding
+
 @dataclass
 class ConversationCluster:
+    """Cluster of data points with similar facet values"""
     facet: Facet
     summary: str
     name: str
@@ -46,43 +55,31 @@ class ConversationCluster:
 
     def __hash__(self):
         return hash((self.summary, self.name, self.facet))
-    
+
     def __eq__(self, other):
         if not isinstance(other, ConversationCluster):
             return False
         return self.summary == other.summary and self.name == other.name and self.facet == other.facet
+
+# Alias for clearer naming
+DataCluster = ConversationCluster
 
 @dataclass
 class OpenClioConfig:
     """
     Configuration for a run of openclio.
 
-    There's a lot of params here. General guide:
-    - Decrease llmBatchSize if you get gpu out of memory errors
-    - Decrease maxConversationTokens to around model context length - 1000 (1000 because we need room for prompt and thinking as well)
-    - set tokenizerArgs to {} if you get an error about "enable_thinking" not supported
-    - Set llmExtraInferenceArgs to be whatever is the recommended sampler settings for your llm (these will be passed to vllm.SamplingParams)
+    Quick start guide:
+    - llmBatchSize: Adjust based on API rate limits (default: 1000, lower for Vertex AI)
+    - maxTextChars: Maximum characters per text block (default: 32000 - suitable for long system prompts)
+    - llmExtraInferenceArgs: Sampling parameters passed to LLM (temperature, top_p, etc.)
 
-    Beyond that, the default values here are fine and will adapt to your data size.
+    Hierarchy tuning:
+    - minTopLevelSize=5: Stop building hierarchy when reaching this many top-level clusters
+    - nBaseClustersFunc=lambda n: n//10: Number of base clusters (10 = avg 10 items per cluster)
+    - nDesiredHigherLevelNamesPerClusterFunc=lambda n: n//3: Branching factor (3 = ~1/3 reduction per level)
 
-    If you want to modify stuff more, the first place to start is things that change how the hierarchy is shaped (I include here their default values):
-    minTopLevelSize=5 
-        Once the current highest level of the hierarchy gets <= this many clusters we'll stop making higher levels.
-        You can increase this if you want a wider hierarchy at the top level.
-    nBaseClustersFunc=lambda n: n//10
-        You can change 10 to some larger value if you want more items in each base cluster (10 is number of data points in each base-level cluster, on average)
-    nDesiredHigherLevelNamesPerClusterFunc=lambda n: n//2
-        2 is your "branching factor" of the hierarchy. Higher values will result in more children at each level (and thus, a more shallow hierarchy)
-
-    If each data point doesn't look like a conversation ([{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hey :3"}, ...]), you can modify
-    dedupKeyFunc = lambda dataPoint: <return some value here you can use as a key for deduplicating your data>
-    and
-    getConversationFunc = lambda dataPoint: <return some value here that looks like a conversation>
-
-    If they don't look like a conversation at all, you can't use facets=openclio.mainFacets.
-    However you can use facets=openclio.genericSummaryFacets or make your own facets.
-    If you are making your own facets or using genericSummaryFacets, you can just leave getConversationFunc as it's default value of lambda data: data
-    And it'll pass the data to your facet's getFacetPrompt function (openclio.genericSummaryFacets just calls str(data))
+    The default values work well for most use cases and will adapt to your data size.
     """
     # 
     
@@ -92,14 +89,14 @@ class OpenClioConfig:
     ### General params
     seed: int = 27 #: Useful so runs are deterministic
     verbose: bool = True #: Whether to print intermediate outputs and progress bars
-    llmBatchSize: int = 1000 #: Batch size to use when doing llm calls. Larger batch will run faster but takes more gpu memory
-    embedBatchSize: int = 1000 #: Batch size to use when embedding. Larger batch will run faster but takes more gpu memory
-    dedupData: bool = True #: Whether to deduplicate the data. This is very important as non-deduped data can result in very large cluster sizes (because all the values are the same)
-    dedupKeyFunc: Optional[Callable[[Any], Any]] = None #: The function to use for comparing if two pieces of data are equivalent. If None, will use prompts.conversationToString if it's a list, or just the value otherwise
+    llmBatchSize: int = 50 #: Batch size for LLM calls. Lower for API rate limits (Vertex AI), higher for local models
+    embedBatchSize: int = 1000 #: Batch size for embedding. Larger is faster but takes more memory
+    dedupData: bool = True #: Whether to deduplicate the data. Important to avoid large clusters of identical values
+    dedupKeyFunc: Optional[Callable[[Any], Any]] = None #: Function for comparing data equivalence. If None, uses str() for strings or conversationToString for lists
 
     ### Generate Base Clusters params
-    getConversationFunc: Callable[[Any], List[Dict[str, str]]] = lambda conversation: conversation #: Function to extract the data (used for looking up facets) from a specific point of data, by default assumes this is the identity function. Useful if your data is like a tuple where one of the entries is the conversation (just return that entry)
-    maxConversationTokens: int = 8000 #: Max tokens for a conversation, conversations will be truncated after this (rounding to turn boundaries ending with assistant). Important to prevent overwhelming the model context size
+    getConversationFunc: Callable[[Any], Any] = lambda data: data #: Function to extract text from data point. Identity function by default (data is already text)
+    maxTextChars: int = 32000 #: Max characters per text block. Texts will be truncated to this length to avoid overwhelming model context
     nBaseClustersFunc: Callable[[int], int] = lambda n: n//10 # Number of base clusters to start with, depends on data size. If unspecified, will set to lambda n: n//10
     maxPointsToSampleInsideCluster: int = 10 #: Number of points we sample inside the cluster, when determining base cluster names and summaries. More will make longer contexts but give the llm more information
     maxPointsToSampleOutsideCluster: int = 10 #: Number of points we sample outside the cluster (as examples of stuff closest to, but *not* in the cluster), when determining base cluster names and summaries. More will make longer contexts but give the llm more information
@@ -139,25 +136,25 @@ class OpenClioConfig:
     })
 
     ### Umap settings
-    conversationToStrFunc: Optional[Callable[[List[Dict[str, str]]], str]] = None #: Function to convert data points into strings to be embedded, when generating the 2D umap plot
+    conversationToStrFunc: Optional[Callable[[Any], str]] = None #: Function to convert data points into strings to be embedded for 2D umap plot. If None, uses str() for text data
 
-    ### Website settings
-    password: Optional[str] = None #: Password protect webui files, if None they aren't protected
-    htmlMaxSizePerFile: int = 10000000 #: Maximum size per json file: the data on the website is split up into chunks of this size or less and setup so you can stream the data as needed
-    htmlConversationFilterFunc: Optional[Callable[[List[Dict[str, str]], ConversationFacetData], bool]] = None #: Optional function that takes two inputs (dataPoint: Any, dataPointFacetData: ConversationFacetData) and returns bool if we should include that data on the website.
-    htmlDataToJsonFunc: Optional[Callable[[Any], Dict[str, Any]]] = None #: Optional function that takes a data point and returns a json of the corresponding conversation. It should look like [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hey :3"}, ...]. If you just want to dispaly the data as a string, just return a single entry like this: [{"role": "<whatever you want>", "content": "<your str content>"}]
-    
+    ### Widget/Website settings
+    htmlMaxSizePerFile: int = 10000000 #: Maximum size per json file for web output (default: 10MB chunks)
+    htmlConversationFilterFunc: Optional[Callable[[Any, ConversationFacetData], bool]] = None #: Optional function to filter which data points are included in output
+    htmlDataToJsonFunc: Optional[Callable[[Any], Dict[str, Any]]] = None #: Optional function to convert data point to JSON for display. If None, wraps text as {"text": "..."}
 
-    ### Webui settings
-    webuiPort: int = 8421
+    ### Deprecated/legacy settings
+    password: Optional[str] = None #: Deprecated - password protection not used in widget mode
+    webuiPort: int = 8421 #: Deprecated - not used in widget mode
 
 @dataclass
 class OpenClioResults:
+    """Results from running Clio analysis on text data"""
     facets: List[Facet]
     facetValues: List[ConversationFacetData]
     facetValuesEmbeddings: List[Optional[EmbeddingArray]]
     baseClusters: List[Optional[List[ConversationCluster]]]
     rootClusters: List[Optional[List[ConversationCluster]]]
-    data: List[List[Dict[str, str]]]
+    data: List[Any]  # List of text strings or conversations
     umap: List[Optional[npt.NDArray[np.float32]]]
     cfg: OpenClioConfig

@@ -1,27 +1,56 @@
-from typing import List, Dict
+from typing import List, Dict, Optional, Any
 from collections import defaultdict
+
+
+def format_messages_as_text(messages: List[Dict[str, str]]) -> str:
+    """
+    Simple message formatter when tokenizer/chat_template not available.
+    Formats messages as plain text conversation.
+    """
+    result = []
+    for msg in messages:
+        role = msg.get('role', '').capitalize()
+        content = msg.get('content', '')
+        result.append(f"{role}:\n{content}")
+    return "\n\n".join(result)
 
 
 global cachedTokenizer
 cachedTokenizer = None
 global replacementCache
 replacementCache = {}
+
 def doCachedReplacements(funcName, tokenizer, getMessagesFunc, replacementsDict, tokenizerArgs):
     """
-    Optimization to substantially speed up tokenization by caching the results and doing string substitutions at the end
+    Optimization to substantially speed up tokenization by caching the results and doing string substitutions at the end.
+    If tokenizer is None, uses simple text formatting instead.
     Requires putting REPLACE at the end of each thing you replace, I did this to avoid overlaps with existing stuff in the data
     """
     global cachedTokenizer
     global replacementCache
+
     # if they change tokenizer, reset cache
     if cachedTokenizer != (tokenizerArgs, tokenizer):
         replacementCache = {}
         cachedTokenizer = (tokenizerArgs, tokenizer)
+
     if not funcName in replacementCache:
         messages = getMessagesFunc()
-        inputs = tokenizer.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt", continue_final_message=True, **tokenizerArgs)
-        prompt = tokenizer.decode(inputs['input_ids'][0])
+
+        if tokenizer is None:
+            # No tokenizer available - use simple text formatting
+            prompt = format_messages_as_text(messages)
+        else:
+            # Use tokenizer's chat template
+            try:
+                inputs = tokenizer.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt", continue_final_message=True, **tokenizerArgs)
+                prompt = tokenizer.decode(inputs['input_ids'][0])
+            except:
+                # Fall back to simple formatting if chat template fails
+                prompt = format_messages_as_text(messages)
+
         replacementCache[funcName] = prompt
+
     prompt = replacementCache[funcName]
     for key, value in replacementsDict.items():
         prompt = prompt.replace("{" + key + "REPLACE}", str(value))
@@ -59,7 +88,7 @@ Put your answer in this format:
     )
 
 
-def conversationToString(conversation: List[Dict[str, str]], tokenizer, maxTokens: int=-1) -> str:
+def conversationToString(conversation: List[Dict[str, str]], tokenizer: Optional[Any], maxTokens: int=-1) -> str:
     """
     Converts a conversation like
     [
@@ -71,15 +100,19 @@ def conversationToString(conversation: List[Dict[str, str]], tokenizer, maxToken
     Hi there
     Assistant:
     Hi:3
-    And truncates (rounding down to conversation boundaries) to maxTokens
+    And truncates (rounding down to conversation boundaries) to maxTokens (if tokenizer provided)
     """
     fullConversation = "\n".join([f"{turn['role']}:\n{turn['content']}" for turn in conversation])
-    if maxTokens < 0:
+
+    if maxTokens < 0 or tokenizer is None:
         return fullConversation
+
     if len(fullConversation) < maxTokens * 1.5: # lower bound estimate to avoid cost of running tokenizer
-        return fullConversation 
+        return fullConversation
+
     if len(tokenizer.encode(fullConversation)) < maxTokens:
         return fullConversation
+
     conversationPieces = []
     turnsToAdd = []
     for turn in conversation:

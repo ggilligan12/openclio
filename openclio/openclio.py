@@ -1,9 +1,8 @@
 from dataclasses import dataclass, field
-import vllm
 import pandas as pd
 from typing import Any, Union, Tuple, Optional, Callable, Dict, List, TypeAlias
 import traceback
-import faiss 
+import faiss
 import functools
 from sentence_transformers import SentenceTransformer
 import numpy as np
@@ -23,52 +22,44 @@ import random
 import cloudpickle
 from pathlib import Path
 
+from .llm_interface import LLMInterface
 from .prompts import getFacetPrompt, getFacetClusterNamePrompt, getNeighborhoodClusterNamesPrompt, getDeduplicateClusterNamesPrompt, getAssignToHighLevelClusterPrompt, getRenamingHigherLevelClusterPrompt, getSummarizeFacetPrompt, getFacetPrompt, conversationToString
 from .utils import flatten, unflatten, runBatched, dedup, runWebui
 from .opencliotypes import Facet, FacetValue, ConversationFacetData, ConversationEmbedding, ConversationCluster, OpenClioConfig, OpenClioResults, EmbeddingArray, shouldMakeFacetClusters
 from .faissKMeans import FaissKMeans
 from .writeOutput import convertOutputToWebpage, computeUmap
+from .structured_outputs import FacetAnswer, ClusterNames, DeduplicatedNames, ClusterAssignment, ClusterRenaming
 
-# these are facets from the paper
-mainFacets = [
+# Facets for analyzing system prompts for AI agents
+systemPromptFacets = [
     Facet(
-        name="Request",
-        question="What is the user’s overall request for the assistant?",
-        prefill="The user’s overall request for the assistant is to",
-        summaryCriteria="The cluster name should be a sentence in the imperative that captures the user’s request. For example, ‘Brainstorm ideas for a birthday party’ or ‘Help me find a new job.",
+        name="Primary Purpose",
+        question="What is the primary purpose or role of the AI agent described in this system prompt?",
+        prefill="The primary purpose of this AI agent is to",
+        summaryCriteria="The cluster name should be a clear phrase describing the agent's main function or role, such as 'Customer support chatbot' or 'Code generation assistant'.",
     ),
     Facet(
-        name="Language",
-        question="What are the main languages of the conversation? Do not mention programming languages and do not provide only language codes; only the full names for human languages, like ‘English’ or ‘Arabic; Indonesian’. Do not include language families (just provide the general language, e.g., ‘Arabic’ and not ‘Tripolitanian Arabic’; something that a standard langcodes package would be able to identify). Only consider languages in or after the human’s first request. Output each language as a single full word with no other commentary.",
+        name="Domain",
+        question="What domain or subject area does this AI agent operate in? (e.g., healthcare, finance, education, general purpose, etc.)",
+        prefill="This AI agent operates in the domain of",
+        summaryCriteria="The cluster name should describe the domain or industry, such as 'Healthcare and medical advice' or 'Software development'.",
     ),
     Facet(
-        name="Task",
-        question="What task is the model being asked to perform in this conversation?",
-        prefill="The task is to",
-        # I made this, wasn't described in paper
-        summaryCriteria="The cluster name should be a clear single sentence that captures the specific action or task the model is being asked to perform in the conversation. It should use an active verb and be written from the model's perspective. For example, ‘Generate a creative writing story about space exploration’ or ‘Calculate the probability of winning a card game’",
+        name="Key Capabilities",
+        question="What are the key capabilities or features emphasized in this system prompt? List the most important ones.",
+        prefill="The key capabilities are",
+        summaryCriteria="The cluster name should summarize the main capabilities, such as 'Multi-language translation and cultural adaptation' or 'Data analysis and visualization'.",
     ),
     Facet(
-        name="Concerning",
-        question="""On a scale of 1 to 5, how concerning or potentially harmful is this conversation from a safety perspective? Use the following scale:
-1: Not concerning at all. Completely benign conversation.
-Example: A friendly chat about favorite books or movies.
-
-2: Slightly concerning, but likely harmless.
-Example: A heated but civil debate about politics.
-
-3: Moderately concerning. May warrant a closer look.
-Example: Discussion of controversial topics that could escalate.
-
-4: Very concerning. Likely needs review.
-Example: Conversations involving potential self-harm or harmful ideation.
-
-5: Extremely concerning. Immediate review needed.
-Example: Explicit threats of violence or illegal activities.
-Answer with only a single number from 1 to 5.""",
-        numeric=(1,5),
-    )
+        name="Interaction Style",
+        question="What interaction style or personality is the AI agent instructed to adopt? (e.g., professional, casual, empathetic, technical, etc.)",
+        prefill="The interaction style is",
+        summaryCriteria="The cluster name should describe the tone and manner, such as 'Professional and concise' or 'Friendly and conversational'.",
+    ),
 ]
+
+# Deprecated - kept for backwards compatibility
+mainFacets = systemPromptFacets
 
 genericSummaryFacets = [
     Facet(
@@ -82,34 +73,33 @@ genericSummaryFacets = [
 ]
 
 
-def runClio(facets: List[Facet], 
-            llm: vllm.LLM,
+def runClio(facets: List[Facet],
+            llm: LLMInterface,
             embeddingModel: SentenceTransformer,
-            data: List[List[Dict[str, str]]],
+            data: List[str],
             outputDirectory: str,
-            htmlRoot: str,
-            hostWebui: bool = True,
+            htmlRoot: str = None,
+            displayWidget: bool = False,
             cfg: OpenClioConfig = None,
             **kwargs
         ) -> OpenClioResults:
     """
-    Runs the Clio algorithm on the given conversations, using the given llm and embeddingModel.
+    Runs the Clio algorithm on text data, using the given llm and embeddingModel.
 
-    Clio extracts facets from each conversation, then for some of those facets it generates a hierarchy you can view.
+    Clio extracts facets from each text, then for some of those facets it generates a hierarchy you can view.
 
-    Once you are done with this, see convertOutputToJsonChunks
-    
     Keyword arguments:
-    facets -- The facets we will extract from each conversation. You can use facets=openclio.mainFacets to use the facets from the paper.
-    llm -- The llm that is used to extract facets and cluster data. This should be a vllm.LLM instance
-    embeddingModel -- The embedding model used for clustering data (and a few other things). This should be a SentenceTransformer instance
-    data -- The conversations we are running clio on. These should be formatted like [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hi :3"},...] (see OpenClioConfig in opencliotypes.py if your data isn't formatted like this)
+    facets -- The facets we will extract from each text. Use facets=openclio.systemPromptFacets to analyze system prompts.
+    llm -- The llm that is used to extract facets and cluster data. This should be an LLMInterface instance (e.g., VertexLLMInterface)
+    embeddingModel -- The embedding model used for clustering data. This should be a SentenceTransformer instance
+    data -- The text data we are running clio on. Each element should be a string.
     outputDirectory -- The directory path where we store checkpoints/outputs
-    htmlRoot -- The path where the visuals will be stored on your website. For example, "/opencliooutputs"
-    cfg -- Optional, an instance of openclio.OpenClioConfig, this lets you modify some of openclio's settings. Look at the comments for what individual fields mean.
+    htmlRoot -- (Optional) The path where the visuals will be stored on your website. For example, "/opencliooutputs". If None and displayWidget=False, no output is generated.
+    displayWidget -- (Default: False) If True, displays an interactive widget in Jupyter/Colab. If False, generates web files if htmlRoot is provided.
+    cfg -- Optional, an instance of openclio.OpenClioConfig, this lets you modify some of openclio's settings.
     Any extra args you provide will be assigned to your OpenClioConfig
     Returns:
-    An OpenClioResults object that contains the results of Clio. You can use convertOutputToJsonChunks (in writeOutput.py) to write this result to a directory for html browsing.
+    An OpenClioResults object that contains the results of Clio.
     """
 
     # make the output directory to store checkpoints if it does not exist
@@ -152,15 +142,19 @@ def runClio(facets: List[Facet],
         if cfg.dedupData:
             dedupKeyFunc = cfg.dedupKeyFunc
             if dedupKeyFunc is None:
-                if len(data) > 0 and type(data[0]) in [list, np.ndarray, pd.core.series.Series]:
-                    # tokenize and truncate key func
+                if len(data) > 0 and isinstance(data[0], str):
+                    # For text data, use string identity
+                    cfg.print("Using text dedup (string comparison)")
+                    dedupKeyFunc = lambda x: x.strip().lower()
+                elif len(data) > 0 and type(data[0]) in [list, np.ndarray, pd.core.series.Series]:
+                    # Legacy conversation format - tokenize and truncate
                     tokenizer = llm.get_tokenizer()
-                    cfg.print("Using default conversation dedup key func")
-                    dedupKeyFunc = lambda conversation: conversationToString(conversation, tokenizer=tokenizer, maxTokens=cfg.maxConversationTokens)
+                    cfg.print("Using conversation dedup key func")
+                    dedupKeyFunc = lambda conversation: conversationToString(conversation, tokenizer=tokenizer, maxTokens=cfg.maxTextChars)
                 else:
-                    # identity key func
-                    cfg.print("Using identity key func")
-                    dedupKeyFunc = lambda x: x
+                    # Generic fallback
+                    cfg.print("Using identity dedup key func")
+                    dedupKeyFunc = lambda x: str(x)
             data, dependencyModified = runIfNotExist("dedupedData.pkl", lambda:
                 dedup(data, dedupKeyFunc=dedupKeyFunc, batchSize=cfg.llmBatchSize, verbose=cfg.verbose),
                 dependencyModified=dependencyModified
@@ -253,27 +247,36 @@ def runClio(facets: List[Facet],
     output, dependencyModified = runIfNotExist("results.pkl", getResults,
         dependencyModified=dependencyModified
     )
-    htmlOutputPath = os.path.join(outputDirectory, htmlRoot.strip()[1:] if htmlRoot.strip().startswith("/") else htmlRoot)
-    cfg.print(f"Outputting to webpage at path {htmlOutputPath}")
-    # clear old outputs
-    if not htmlRoot in ["/", ""] and os.path.exists(htmlOutputPath):
-        cfg.print(f"Removing old outputs at {htmlOutputPath}")
-        shutil.rmtree(htmlOutputPath)
-    Path(htmlOutputPath).mkdir(parents=True, exist_ok=True)
-    convertOutputToWebpage(
-        output=output,
-        rootHtmlPath=htmlRoot,
-        targetDir=htmlOutputPath,
-        maxSizePerFile=cfg.htmlMaxSizePerFile,
-        conversationFilter=cfg.htmlConversationFilterFunc,
-        dataToJson=cfg.htmlDataToJsonFunc,
-        verbose=cfg.verbose,
-        password=cfg.password
-    )
 
-    # write redirect page if we are nested, so the webui opens to it nicely
-    if not htmlRoot in ["/", ""]:
-        redirectPage = f"""
+    # Display widget or generate web output
+    if displayWidget:
+        cfg.print("Displaying widget")
+        from .widget import ClioWidget
+        widget = ClioWidget(output)
+        widget.display()
+        return output
+    elif htmlRoot is not None:
+        htmlOutputPath = os.path.join(outputDirectory, htmlRoot.strip()[1:] if htmlRoot.strip().startswith("/") else htmlRoot)
+        cfg.print(f"Outputting to webpage at path {htmlOutputPath}")
+        # clear old outputs
+        if not htmlRoot in ["/", ""] and os.path.exists(htmlOutputPath):
+            cfg.print(f"Removing old outputs at {htmlOutputPath}")
+            shutil.rmtree(htmlOutputPath)
+        Path(htmlOutputPath).mkdir(parents=True, exist_ok=True)
+        convertOutputToWebpage(
+            output=output,
+            rootHtmlPath=htmlRoot,
+            targetDir=htmlOutputPath,
+            maxSizePerFile=cfg.htmlMaxSizePerFile,
+            conversationFilter=cfg.htmlConversationFilterFunc,
+            dataToJson=cfg.htmlDataToJsonFunc,
+            verbose=cfg.verbose,
+            password=cfg.password
+        )
+
+        # write redirect page if we are nested, so the webui opens to it nicely
+        if not htmlRoot in ["/", ""]:
+            redirectPage = f"""
 <!DOCTYPE html>
 <html>
 <head>
@@ -283,13 +286,11 @@ def runClio(facets: List[Facet],
     <p>If you are not redirected, <a href="{htmlRoot}">click here</a></p>
 </body>
 </html>
-        """
-        with open(os.path.join(outputDirectory, "index.html"), "w") as f:
-            f.write(redirectPage)
+            """
+            with open(os.path.join(outputDirectory, "index.html"), "w") as f:
+                f.write(redirectPage)
 
-    if hostWebui:
-        cfg.print(f"Running webui")
-        runWebui(outputDirectory, cfg.webuiPort)
+    return output
 
 
 
@@ -339,7 +340,7 @@ def getNeighborhoods(
 
 def getHierarchy(
     facets: List[Facet],
-    llm: vllm.LLM,
+    llm: LLMInterface,
     embeddingModel: SentenceTransformer,
     baseClusters: List[Optional[List[ConversationCluster]]],
     cfg: OpenClioConfig) -> List[Optional[List[ConversationCluster]]]:
@@ -363,9 +364,7 @@ def getHierarchy(
     def processBatchFuncLLM(prompts: List[str]) -> List[str]:
         nonlocal seed # we increment it so duplicate entries will get distinct things
         seed += 1
-        samplingParams = vllm.SamplingParams(seed=seed, **cfg.llmExtraInferenceArgs)
-        modelOutputs = llm.generate(prompts, sampling_params=samplingParams, use_tqdm=False)
-        return [modelOutput.outputs[0].text for modelOutput in modelOutputs] 
+        return llm.generate_batch(prompts, **cfg.llmExtraInferenceArgs) 
     
     topLevelParents = []
     for facetI, facet in enumerate(facets):
@@ -431,9 +430,7 @@ def getHierarchy(
                     cfg.print(prompt)
                     nonlocal seed # we increment it so duplicate entries will get distinct things
                     seed += 1
-                    samplingParams = vllm.SamplingParams(seed=seed, **cfg.llmExtraInferenceArgs)
-                    modelOutputs = llm.generate([prompt], sampling_params=samplingParams, use_tqdm=False)
-                    clusterNamesOutput = [modelOutput.outputs[0].text for modelOutput in modelOutputs][0]
+                    clusterNamesOutput = llm.generate_batch([prompt], **cfg.llmExtraInferenceArgs)[0]
                     clusterNames = extractAnswerNumberedList(clusterNamesOutput, ignoreNoTrailing=True)
                     if len(clusterNames) != 0:
                         cfg.print("Success at manual retry")
@@ -632,7 +629,7 @@ def getHierarchy(
 
 def getBaseClusters(
         facets: List[Facet],
-        llm: vllm.LLM,
+        llm: LLMInterface,
         embeddingModel: SentenceTransformer,
         facetValues: List[ConversationFacetData],
         facetValuesEmbeddings: List[Optional[EmbeddingArray]],
@@ -688,14 +685,12 @@ def getBaseClusters(
             def processBatchFunc(batchOfPrompts: List[str]) -> List[str]:
                 nonlocal seed
                 seed += 1 # do this so repeated entries get different outputs
-                samplingParams = vllm.SamplingParams(seed=seed, **cfg.llmExtraInferenceArgs)
                 try:
-                    modelOutputs = llm.generate(batchOfPrompts, sampling_params=samplingParams, use_tqdm=False)
+                    return llm.generate_batch(batchOfPrompts, **cfg.llmExtraInferenceArgs)
                 except:
                     with open("badInputs.pkl", "wb") as f:
                         cloudpickle.dump(batchOfPrompts, f)
                     raise
-                return [modelOutput.outputs[0].text for modelOutput in modelOutputs]
 
             def processOutputFunc(
                     clusterIndex: int,
@@ -770,45 +765,58 @@ def getFacetValuesEmbeddings(
 
 def getFacetValues(
         facets: List[Facet],
-        llm: vllm.LLM,
-        data: List[List[Dict[str, str]]],
+        llm: LLMInterface,
+        data: List[Any],
         cfg: OpenClioConfig
     ) -> List[ConversationFacetData]:
     """
-    Gets facet values for every conversation, for each of the facets provided, using the provided llm.
-    Returns a list of ConversationFacetData objects,
-    one for each conversation
+    Gets facet values for every data point, for each of the facets provided, using the provided llm.
+    Returns a list of ConversationFacetData objects, one for each data point.
     """
     tokenizer = llm.get_tokenizer()
-    def getInputsFunc(conversation: List[Dict[str, str]]) -> List[str]:
+
+    def getInputsFunc(data_point: Any) -> List[str]:
         # runBatched will automatically flatten these into us for nice batched usage,
         # then unflatten them back before calling processOutputFunc
         # so we can send in whatever sort of nested lists we want (though in this case it's only one deep)
-        conversation = cfg.getConversationFunc(conversation) # map it, if needed
+        data_point = cfg.getConversationFunc(data_point) # map it, if needed
+
+        # Truncate text if too long
+        if isinstance(data_point, str) and len(data_point) > cfg.maxTextChars:
+            data_point = data_point[:cfg.maxTextChars]
+
         inputs = []
         for facet in facets:
             if facet.getFacetPrompt is None:
-                facetInput = getFacetPrompt(tokenizer, facet, conversation, cfg, tokenizerArgs=cfg.tokenizerArgs)
+                facetInput = getFacetPrompt(tokenizer, facet, data_point, cfg, tokenizerArgs=cfg.tokenizerArgs)
             else:
-                facetInput = facet.getFacetPrompt(tokenizer, facet, conversation, cfg, tokenizerArgs=cfg.tokenizerArgs)
+                facetInput = facet.getFacetPrompt(tokenizer, facet, data_point, cfg, tokenizerArgs=cfg.tokenizerArgs)
             inputs.append(facetInput)
         return inputs
     seed = cfg.seed
     def processBatchFunc(batchOfPrompts: List[str]) -> List[str]:
         nonlocal seed
         seed += 1
-        samplingParams = vllm.SamplingParams(seed=seed, **cfg.llmExtraInferenceArgs)
-        modelOutputs = llm.generate(batchOfPrompts, sampling_params=samplingParams, use_tqdm=False)
-        return [modelOutput.outputs[0].text for modelOutput in modelOutputs]
+        # Use structured outputs for reliable parsing
+        return llm.generate_batch(batchOfPrompts, response_schema=FacetAnswer, **cfg.llmExtraInferenceArgs)
 
-    def processOutputFunc(conversation: List[Dict[str, str]], conversationPrompts: List[str], facetOutputs: List[str]) -> ConversationFacetData:
+    def processOutputFunc(data_point: Any, data_point_prompts: List[str], facetOutputs: List[str]) -> ConversationFacetData:
+        facet_values = []
+        for facet, output in zip(facets, facetOutputs):
+            try:
+                # Parse structured JSON output
+                parsed = json.loads(output)
+                value = parsed.get("answer", "").strip()
+            except (json.JSONDecodeError, KeyError):
+                # Fallback to tag extraction for backwards compatibility
+                _, value = extractTagValue(output, "answer")
+                value = value.strip()
+
+            facet_values.append(FacetValue(facet=facet, value=value))
+
         return ConversationFacetData(
-            conversation=conversation,
-            facetValues=[
-                FacetValue(
-                    facet=facet,
-                    value=extractTagValue(value, "answer")[1].strip()
-                ) for (facet, value) in zip(facets, facetOutputs)]
+            conversation=data_point,
+            facetValues=facet_values
         )
 
     return runBatched(data,

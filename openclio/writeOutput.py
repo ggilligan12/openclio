@@ -279,7 +279,7 @@ def computeUmapHelper(embeddingArr: EmbeddingArray, verbose: bool = False):
     umapModel = umap.UMAP(n_components=2, unique=True, verbose=verbose)
     return umapModel.fit_transform(embeddingArr)
 
-def computeUmap(data: List[Any], facetValuesEmbeddings: List[Optional[EmbeddingArray]], embeddingModel: SentenceTransformer, tokenizer, cfg: OpenClioConfig):
+def computeUmap(data: List[Any], facetValuesEmbeddings: List[Optional[EmbeddingArray]], embeddingModel: SentenceTransformer, tokenizer: Optional[Any], cfg: OpenClioConfig):
     cfg.print("Running umap on facet values")
     resUmaps = [(computeUmapHelper(embeddingArr, verbose=cfg.verbose) if embeddingArr is not None else None) for embeddingArr in facetValuesEmbeddings]
     cfg.print("Embedding conversations for umap")
