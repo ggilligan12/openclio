@@ -1,6 +1,5 @@
 import datetime
 import pytz
-import vllm
 from typing import Tuple, List, Dict, Callable, Any
 from sentence_transformers import SentenceTransformer
 import os
@@ -90,13 +89,12 @@ class KeyPoller():
                 return sys.stdin.read(1)
             return None
 
-def getModels() -> Tuple[vllm.LLM, SentenceTransformer]:
-    """Get the default models we use (llm, embeddingModel) for running clio"""
-    #model_str = "Qwen/Qwen2.5-7B-Instruct"
-    model_str = "Qwen/Qwen3-8B"
-    llm = vllm.LLM(model=model_str)
-    embeddingModel = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
-    return llm, embeddingModel
+# Deprecated: getModels() removed - use VertexLLMInterface instead
+# Example:
+# from openclio import VertexLLMInterface
+# from sentence_transformers import SentenceTransformer
+# llm = VertexLLMInterface(model_name="gemini-1.5-flash", project_id="your-project")
+# embedding_model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
 
 def filterDataToEnglish(data : List[List[Dict[str,str]]]) -> List[List[Dict[str,str]]]:
     """Simple filter function that restricts us to only data that has english on all turns"""
