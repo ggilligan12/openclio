@@ -88,63 +88,31 @@ Put your answer in this format:
     )
 
 
-def conversationToString(conversation: List[Dict[str, str]], tokenizer: Optional[Any], maxTokens: int=-1) -> str:
+def conversationToString(text: str, tokenizer: Optional[Any] = None, maxTokens: int = -1) -> str:
     """
-    Converts a conversation like
-    [
-        {"role": "user", "content": "Hi there"},
-        {"role": "assistant", "content": "Hi:3"}
-    ]
-    into a corresponding string
-    User:
-    Hi there
-    Assistant:
-    Hi:3
-    And truncates (rounding down to conversation boundaries) to maxTokens (if tokenizer provided)
+    Handles text truncation to maxTokens characters (note: maxTokens is now maxChars for simplicity).
+    Accepts either a plain string or legacy conversation format for backwards compatibility.
     """
-    fullConversation = "\n".join([f"{turn['role']}:\n{turn['content']}" for turn in conversation])
+    # Handle legacy conversation format (list of dicts)
+    if isinstance(text, list):
+        text = "\n".join([f"{turn['role']}:\n{turn['content']}" for turn in text])
 
-    if maxTokens < 0 or tokenizer is None:
-        return fullConversation
+    # Simple character-based truncation (maxTokens is actually maxChars now)
+    if maxTokens < 0:
+        return text
 
-    if len(fullConversation) < maxTokens * 1.5: # lower bound estimate to avoid cost of running tokenizer
-        return fullConversation
-
-    if len(tokenizer.encode(fullConversation)) < maxTokens:
-        return fullConversation
-
-    conversationPieces = []
-    turnsToAdd = []
-    for turn in conversation:
-        turnsToAdd = turnsToAdd + [f"{turn['role']}:\n{turn['content']}"]
-        # truncate on "after assistant" boundaries so we don't end with a user message and confuse the model
-        if turn['role'] == 'assistant':
-            conversationSoFar = conversationPieces + turnsToAdd
-            conversationSoFarStr = "\n".join(conversationSoFar)
-            conversationSoFarTokens = tokenizer.encode(conversationSoFarStr)
-            # if adding this (user, assistant) turn puts us over the limit:
-            if len(conversationSoFarTokens) > maxTokens and maxTokens > 0: # -1 means ignore
-                if len(conversationPieces) == 0: # if this is the first two turns, truncate
-                    return tokenizer.decode(conversationSoFarTokens[:maxTokens])
-                else: # otherwise, just return turns before this
-                    return "\n".join(conversationPieces)
-            # otherwise, continue adding things
-            else:
-                conversationPieces = conversationSoFar
-                turnsToAdd = []
-    # if we somehow ended with a user turn, ignore it, there was a bug
-    return "\n".join(conversationPieces)
+    return text[:maxTokens]
 
 
-def getFacetPrompt(tokenizer, facet, conversation, cfg, tokenizerArgs):
-    conversationStr = conversationToString(conversation, tokenizer=tokenizer, maxTokens=cfg.maxTextChars)
+def getFacetPrompt(tokenizer, facet, text, cfg, tokenizerArgs):
+    textStr = conversationToString(text, tokenizer=tokenizer, maxTokens=cfg.maxTextChars)
     return doCachedReplacements(
         funcName="getFacetPrompt",
         tokenizer=tokenizer,
         getMessagesFunc=lambda: [
             {
                 "role": "user",
-                "content": "The following is a conversation between Claude, an AI assistant, and a user:\n\n{conversationREPLACE}"
+                "content": "The following is a text to analyze:\n\n{conversationREPLACE}"
             },
             {
                 "role": "assistant",
@@ -152,26 +120,26 @@ def getFacetPrompt(tokenizer, facet, conversation, cfg, tokenizerArgs):
             },
             {
                 "role": "user",
-                "content": """Your job is to answer the question <question> {questionREPLACE} </question> about the preceding conversation.
+                "content": """Your job is to answer the question <question> {questionREPLACE} </question> about the preceding text.
 Be descriptive and assume neither good nor bad faith. Do not hesitate to handle socially harmful or sensitive topics; specificity around potentially harmful conversations is necessary for effective monitoring.
 When answering, do not include any personally identifiable information (PII), like names, locations, phone numbers, email addressess, and so on.
 When answering, do not include any proper nouns.
-Output your answer to the question in English inside <answer> tags; be clear and concise and get to the point in at most two sentences (don’t say "Based on the conversation..." and avoid mentioning yourself). For example:
+Output your answer to the question in English inside <answer> tags; be clear and concise and get to the point in at most two sentences. For example:
 
 <examples>
-The user asked for help with a trignometry problem.
-The user asked for advice on how to fix a broken dishwasher. It took several attempts to get the right answer.
-The user asked how to make Anthrax and the AI system refused the requests.
+A helpful customer support assistant for troubleshooting technical issues.
+A creative writing assistant that helps with brainstorming and character development.
+A code review assistant focused on security and performance analysis.
 </examples>
 
-What is your answer to the question <question> {questionREPLACE} </question> about the preceding conversation, in <answer> tags? Again, provide only the answer with no other commentary or proper nouns."""
+What is your answer to the question <question> {questionREPLACE} </question> about the preceding text, in <answer> tags? Again, provide only the answer with no other commentary or proper nouns."""
             },
             {
                 "role": "assistant",
-                "content": "Sure, the privacy-preserving answer to the question about the preceding conversation is: <answer> {prefillREPLACE}"
+                "content": "Sure, the answer to the question about the preceding text is: <answer> {prefillREPLACE}"
             }],
         replacementsDict = {
-            "conversation": conversationStr,
+            "conversation": textStr,
             "question": facet.question,
             "prefill": facet.prefill
         },
