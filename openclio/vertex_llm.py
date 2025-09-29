@@ -110,20 +110,16 @@ class VertexLLMInterface(LLMInterface):
         try:
             # Use structured output if schema provided
             if response_schema is not None:
-                generation_config_dict = {
-                    "max_output_tokens": self.generation_config.max_output_tokens,
-                    "temperature": self.generation_config.temperature,
-                    "top_p": self.generation_config.top_p,
-                    "top_k": self.generation_config.top_k,
+                config = {
                     "response_mime_type": "application/json",
                     "response_schema": response_schema,
                 }
                 from vertexai.generative_models import GenerationConfig
-                structured_config = GenerationConfig(**generation_config_dict)
+                generation_config = GenerationConfig(**config)
 
                 response = self.model.generate_content(
                     prompt,
-                    generation_config=structured_config,
+                    generation_config=generation_config,
                 )
             else:
                 response = self.model.generate_content(
