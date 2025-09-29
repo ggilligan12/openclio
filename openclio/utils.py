@@ -11,89 +11,7 @@ from collections import deque, defaultdict
 
 from .prompts import conversationToString
 
-## Stuff for keypoller support on windows
-isWindows = False
-try:
-    from win32api import STD_INPUT_HANDLE
-    from win32console import GetStdHandle, KEY_EVENT, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT
-    isWindows = True
-except ImportError as e:
-    import sys
-    import select
-    import termios
-
-# this is needed because vllm doesn't like being interrupted with ctrl-c
-# so I listen for the c key and if it's sent then we can interrupt
-class KeyPoller():
-    def __init__(self, noCancel=False):
-        self.noCancel = noCancel
-
-    def __enter__(self):
-        if self.noCancel: return self
-
-        # Check if we're in a real terminal (not Jupyter/Colab)
-        try:
-            global isWindows
-            if isWindows:
-                self.readHandle = GetStdHandle(STD_INPUT_HANDLE)
-                self.readHandle.SetConsoleMode(ENABLE_LINE_INPUT|ENABLE_ECHO_INPUT|ENABLE_PROCESSED_INPUT)
-
-                self.curEventLength = 0
-                self.curKeysLength = 0
-
-                self.capturedChars = []
-            else:
-                # Save the terminal settings
-                self.fd = sys.stdin.fileno()
-                self.new_term = termios.tcgetattr(self.fd)
-                self.old_term = termios.tcgetattr(self.fd)
-
-                # New terminal setting unbuffered
-                self.new_term[3] = (self.new_term[3] & ~termios.ICANON & ~termios.ECHO)
-                termios.tcsetattr(self.fd, termios.TCSAFLUSH, self.new_term)
-        except (OSError, IOError):
-            # Not in a real terminal (e.g., Jupyter/Colab), disable key polling
-            self.noCancel = True
-
-        return self
-    
-    def __exit__(self, type, value, traceback):
-        if self.noCancel: return
-        if isWindows:
-            pass
-        else:
-            termios.tcsetattr(self.fd, termios.TCSAFLUSH, self.old_term)
-    
-    def poll(self):
-        if self.noCancel: return None
-        if isWindows:
-            if not len(self.capturedChars) == 0:
-                return self.capturedChars.pop(0)
-
-            eventsPeek = self.readHandle.PeekConsoleInput(10000)
-
-            if len(eventsPeek) == 0:
-                return None
-
-            if not len(eventsPeek) == self.curEventLength:
-                for curEvent in eventsPeek[self.curEventLength:]:
-                    if curEvent.EventType == KEY_EVENT:
-                        if ord(curEvent.Char) == 0 or not curEvent.KeyDown:
-                            pass
-                        else:
-                            curChar = str(curEvent.Char)
-                            self.capturedChars.append(curChar)
-                self.curEventLength = len(eventsPeek)
-
-            if not len(self.capturedChars) == 0:
-                return self.capturedChars.pop(0)
-            else:
-                return None
-        else:
-            dr,dw,de = select.select([sys.stdin], [], [], 0)
-            if not dr == []:
-                return sys.stdin.read(1)
-            return None
+# KeyPoller removed - not needed for Vertex AI and incompatible with Jupyter/Colab
 
 # Deprecated: getModels() removed - use VertexLLMInterface instead
 # Example:
@@ -320,26 +238,19 @@ def runBatchedIterator(inputs, n, getInputs, processBatch, processOutput, batchS
             yield results
 
     startTime = timestampMillis()
-    # we need keypoller because vllm doen't like to be keyboard interrupted
-    with KeyPoller(noCancel) as keypoller:
-        def runOnBatchedFunc(batchEnd):
-            elapsed = timestampMillis() - startTime
-            secondsPerPrompt = elapsed / (float(batchEnd))
-            totalTime = elapsed *  n / float(batchEnd)
-            timeLeft = totalTime - elapsed
-            dispStr = secondsToDisplayStr(timeLeft/1000.0)
-            doneDateTimeStr = getFutureDatetime(timeLeft/1000.0).strftime('%I:%M:%S %p')
-            if verbose:
-                print(batchEnd, "/", n, f"{secondsPerPrompt} millis per item {dispStr}done at {doneDateTimeStr}")
-            keys = keypoller.poll()
-            if not keys is None:
-                print(keys)
-                if str(keys) == "c":
-                    print("got c")
-                    raise ValueError("stopped")   
-        
-        for output in onDemandBatchedIter(inputs, runOnBatchedFunc):
-            yield output
+
+    def runOnBatchedFunc(batchEnd):
+        elapsed = timestampMillis() - startTime
+        secondsPerPrompt = elapsed / (float(batchEnd))
+        totalTime = elapsed *  n / float(batchEnd)
+        timeLeft = totalTime - elapsed
+        dispStr = secondsToDisplayStr(timeLeft/1000.0)
+        doneDateTimeStr = getFutureDatetime(timeLeft/1000.0).strftime('%I:%M:%S %p')
+        if verbose:
+            print(batchEnd, "/", n, f"{secondsPerPrompt} millis per item {dispStr}done at {doneDateTimeStr}")
+
+    for output in onDemandBatchedIter(inputs, runOnBatchedFunc):
+        yield output
                 
 
 def getClosestNames(
@@ -390,19 +301,15 @@ def getDuplicateFacetValues(
 def runWebui(path, port):
     """
     Runs a simple http server at the given path, using the given port
+    Note: Use Ctrl+C to stop the server
     """
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=path, **kwargs)
-    with KeyPoller() as keypoller:
-        with socketserver.TCPServer(("", port), Handler) as httpd:
-            print(f"Serving at http://localhost:{port}")
-            while True:
-                httpd.timeout = 0.5          # seconds – how long handle_request() can block
-                keys = keypoller.poll()
-                if not keys is None:
-                    print(keys)
-                    if str(keys) == "c":
-                        print("got c")
-                        raise ValueError("stopped")   
-                httpd.handle_request()   # serves at most one request
+    with socketserver.TCPServer(("", port), Handler) as httpd:
+        print(f"Serving at http://localhost:{port}")
+        print("Press Ctrl+C to stop")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nServer stopped")
