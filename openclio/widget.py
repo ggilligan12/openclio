@@ -28,19 +28,18 @@ def test_widget_components():
         print(f"✗ Basic ipywidgets failed: {e}\n")
         return
 
-    print("\n2. Testing Plotly rendered as HTML...")
+    print("\n2. Testing Plotly rendered as HTML directly...")
     try:
-        plot_output = Output()
-        with plot_output:
-            from IPython.display import HTML as IPyHTML
-            fig = go.Figure(data=[go.Scatter(x=[1, 2, 3], y=[4, 5, 6], mode='markers')])
-            fig.update_layout(title="Test Plot", width=400, height=300)
-            html_str = fig.to_html(include_plotlyjs='cdn')
-            display(IPyHTML(html_str))
-        print("✓ Plotly rendered as HTML - check if plot appears below")
-        display(plot_output)
+        from IPython.display import HTML as IPyHTML
+        fig = go.Figure(data=[go.Scatter(x=[1, 2, 3], y=[4, 5, 6], mode='markers', marker=dict(size=10, color='blue'))])
+        fig.update_layout(title="Test Plot - Should Be Interactive", width=400, height=300)
+        html_str = fig.to_html(include_plotlyjs='cdn', config={'displayModeBar': True})
+        print(f"✓ Generated Plotly HTML ({len(html_str)} chars) - plot should appear below:")
+        display(IPyHTML(html_str))
     except Exception as e:
         print(f"✗ Plotly rendering failed: {e}")
+        import traceback
+        traceback.print_exc()
         return
 
     print("\n3. Testing HTML in Output widget...")
@@ -55,7 +54,23 @@ def test_widget_components():
         print(f"✗ HTML in Output widget failed: {e}")
         return
 
-    print("\n✓ All tests passed!")
+    print("\n4. Testing Plotly with different renderers...")
+    try:
+        import plotly.io as pio
+        print(f"Available renderers: {list(pio.renderers)}")
+        print(f"Default renderer: {pio.renderers.default}")
+
+        fig = go.Figure(data=[go.Scatter(x=[1, 2, 3], y=[4, 5, 6], mode='markers+lines', marker=dict(size=10, color='green'))])
+        fig.update_layout(title="Test Plot Direct Show", width=400, height=300)
+
+        print("✓ Calling fig.show() directly:")
+        fig.show()
+    except Exception as e:
+        print(f"✗ Plotly show() failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+    print("\n✓ Tests complete!")
 
 
 class ClioWidget:
