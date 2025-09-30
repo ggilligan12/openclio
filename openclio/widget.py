@@ -4,10 +4,52 @@ import numpy as np
 from typing import List, Optional
 import plotly.graph_objects as go
 from ipywidgets import widgets, Output, VBox, HBox, HTML
-from IPython.display import display
+from IPython.display import display, clear_output
 import json
 
 from .opencliotypes import OpenClioResults, ConversationCluster, shouldMakeFacetClusters
+
+
+def test_widget_components():
+    """Test if widget components work - call this to debug display issues"""
+    print("Testing widget components...\n")
+
+    # Test 1: Basic ipywidgets
+    print("1. Testing basic ipywidgets...")
+    try:
+        test_button = widgets.Button(description="Test Button")
+        test_dropdown = widgets.Dropdown(options=['A', 'B', 'C'], description='Test:')
+        test_output = Output()
+        with test_output:
+            print("Output widget works!")
+        display(VBox([test_dropdown, test_button, test_output]))
+        print("✓ Basic ipywidgets work\n")
+    except Exception as e:
+        print(f"✗ Basic ipywidgets failed: {e}\n")
+        return
+
+    # Test 2: Plotly
+    print("2. Testing Plotly...")
+    try:
+        fig = go.Figure(data=[go.Scatter(x=[1, 2, 3], y=[4, 5, 6], mode='markers')])
+        fig.update_layout(title="Test Plot", width=400, height=300)
+        display(fig)
+        print("✓ Plotly works\n")
+    except Exception as e:
+        print(f"✗ Plotly failed: {e}\n")
+        return
+
+    # Test 3: HTML widget
+    print("3. Testing HTML widget...")
+    try:
+        html_widget = HTML("<h4>Test HTML</h4><p>This is a test</p>")
+        display(html_widget)
+        print("✓ HTML widget works\n")
+    except Exception as e:
+        print(f"✗ HTML widget failed: {e}\n")
+        return
+
+    print("All tests passed! Widgets should work.")
 
 
 class ClioWidget:
@@ -84,9 +126,9 @@ class ClioWidget:
 
     def _update_plot(self):
         """Update UMAP scatter plot"""
-        with self.plot_output:
-            self.plot_output.clear_output(wait=True)
+        self.plot_output.clear_output(wait=True)
 
+        with self.plot_output:
             facet_idx = self.selected_facet_idx
             umap_coords = self.results.umap[facet_idx]
 
@@ -94,8 +136,8 @@ class ClioWidget:
                 print(f"No UMAP data available for facet {self.results.facets[facet_idx].name}")
                 return
 
-            # Create scatter plot
-            fig = go.Figure()
+            # Create scatter plot using FigureWidget for ipywidgets compatibility
+            fig = go.FigureWidget()
 
             # Add all points
             fig.add_trace(go.Scatter(
@@ -133,6 +175,7 @@ class ClioWidget:
                 xaxis_title="UMAP 1",
                 yaxis_title="UMAP 2",
                 height=500,
+                width=600,
                 hovermode='closest'
             )
 
@@ -140,9 +183,9 @@ class ClioWidget:
 
     def _update_tree(self):
         """Update hierarchy tree view"""
-        with self.tree_output:
-            self.tree_output.clear_output(wait=True)
+        self.tree_output.clear_output(wait=True)
 
+        with self.tree_output:
             facet_idx = self.selected_facet_idx
             root_clusters = self.results.rootClusters[facet_idx]
 
@@ -150,26 +193,33 @@ class ClioWidget:
                 print(f"No clusters available for facet {self.results.facets[facet_idx].name}")
                 return
 
-            html_parts = ["<div style='font-family: monospace; font-size: 12px;'>"]
+            tree_widgets = []
 
             def render_cluster(cluster: ConversationCluster, depth: int = 0):
-                indent = "&nbsp;" * (depth * 4)
                 indices = self._get_cluster_indices(cluster)
                 count = len(indices)
+                indent = "  " * depth
 
-                # Make cluster clickable
-                cluster_id = id(cluster)
-                onclick = f"window.clioSelectCluster({cluster_id}, {json.dumps(indices.tolist())})"
-
-                html_parts.append(
-                    f"{indent}<div style='margin: 2px 0; cursor: pointer;' "
-                    f"onclick='{onclick}' "
-                    f"onmouseover='this.style.backgroundColor=\"#f0f0f0\"' "
-                    f"onmouseout='this.style.backgroundColor=\"transparent\"'>"
-                    f"<b>{cluster.name}</b> ({count} items)"
-                    f"</div>"
+                # Create button for this cluster
+                button_text = f"{indent}{'└─' if depth > 0 else '▶'} {cluster.name} ({count})"
+                btn = widgets.Button(
+                    description=button_text,
+                    layout=widgets.Layout(width='100%', margin='1px'),
+                    button_style='',
+                    tooltip=f'Click to view {count} texts',
+                    style={'button_color': '#f8f9fa' if depth == 0 else '#ffffff'}
                 )
 
+                # Store indices with button for callback
+                def on_click(b, cluster_indices=indices.tolist()):
+                    self.selected_indices = np.array(cluster_indices)
+                    self._update_plot()
+                    self._update_text_viewer(cluster_indices)
+
+                btn.on_click(on_click)
+                tree_widgets.append(btn)
+
+                # Render children
                 if cluster.children:
                     for child in cluster.children:
                         render_cluster(child, depth + 1)
@@ -177,27 +227,15 @@ class ClioWidget:
             for root_cluster in root_clusters:
                 render_cluster(root_cluster)
 
-            html_parts.append("</div>")
-
-            # Add JavaScript for click handling
-            html_parts.append("""
-            <script>
-            window.clioSelectCluster = function(clusterId, indices) {
-                // Store in window for Python to access
-                window.selectedClusterIndices = indices;
-                // Notify Python (this would need proper callback setup)
-                console.log('Selected cluster:', clusterId, 'with', indices.length, 'items');
-            }
-            </script>
-            """)
-
-            display(HTML(''.join(html_parts)))
+            # Display all buttons
+            tree_box = VBox(tree_widgets, layout=widgets.Layout(overflow_y='auto', max_height='400px'))
+            display(tree_box)
 
     def _update_text_viewer(self, indices: List[int], max_display: int = 20):
         """Update text viewer to show selected data points"""
-        with self.text_output:
-            self.text_output.clear_output(wait=True)
+        self.text_output.clear_output(wait=True)
 
+        with self.text_output:
             if len(indices) == 0:
                 print("Select a cluster from the tree to view texts")
                 return
@@ -250,24 +288,76 @@ class ClioWidget:
             print(f"✓ Analysis complete! {len(self.results.facetValues)} texts processed.")
             return
 
-        # Layout
-        left_panel = VBox([
-            HBox([self.facet_dropdown]),
-            self.plot_output
-        ])
+        try:
+            # Layout
+            left_panel = VBox([
+                HBox([self.facet_dropdown]),
+                self.plot_output
+            ])
 
-        right_panel = VBox([
-            HTML("<h4>Cluster Hierarchy</h4>"),
-            self.tree_output,
-            HTML("<h4>Selected Texts</h4>"),
-            self.text_output
-        ])
+            right_panel = VBox([
+                HTML("<h4>Cluster Hierarchy</h4>"),
+                self.tree_output,
+                HTML("<h4>Selected Texts</h4>"),
+                self.text_output
+            ])
 
-        main_layout = HBox([left_panel, right_panel])
-        display(main_layout)
+            main_layout = HBox([left_panel, right_panel])
+            display(main_layout)
 
-        # Instructions
-        print("\n📊 Clio Analysis Widget")
-        print("- Select a facet from the dropdown")
-        print("- Click clusters in the tree to view texts")
-        print("- UMAP plot shows the distribution of all data points")
+            # Instructions
+            print("\n📊 Clio Analysis Widget")
+            print("- Select a facet from the dropdown")
+            print("- Click clusters in the tree to view texts")
+            print("- UMAP plot shows the distribution of all data points")
+        except Exception as e:
+            print(f"\n⚠️  Widget rendering failed: {e}")
+            print("Falling back to text-based display...\n")
+            self._display_text_fallback()
+
+    def _display_text_fallback(self):
+        """Display results as formatted text when widgets don't work"""
+        print("="*80)
+        print("CLIO ANALYSIS RESULTS")
+        print("="*80)
+        print(f"\nTotal texts analyzed: {len(self.results.data)}")
+        print(f"Facets: {', '.join([f.name for f in self.results.facets])}\n")
+
+        # Show cluster summaries for each facet
+        for facet_idx, facet in enumerate(self.results.facets):
+            if not shouldMakeFacetClusters(facet):
+                continue
+
+            print("\n" + "="*80)
+            print(f"FACET: {facet.name}")
+            print("="*80)
+
+            root_clusters = self.results.rootClusters[facet_idx]
+            if root_clusters:
+                print(f"\nFound {len(root_clusters)} top-level clusters:\n")
+                for i, cluster in enumerate(root_clusters):
+                    indices = self._get_cluster_indices(cluster)
+                    print(f"{i+1}. {cluster.name} ({len(indices)} texts)")
+                    if cluster.children:
+                        for child in cluster.children[:5]:  # Show first 5 children
+                            child_indices = self._get_cluster_indices(child)
+                            print(f"   └─ {child.name} ({len(child_indices)} texts)")
+                        if len(cluster.children) > 5:
+                            print(f"   └─ ... and {len(cluster.children) - 5} more")
+            else:
+                print("No clusters generated for this facet")
+
+        # Show sample facet values
+        print("\n" + "="*80)
+        print("SAMPLE FACET VALUES (first 5 texts)")
+        print("="*80)
+        for i, facet_data in enumerate(self.results.facetValues[:min(5, len(self.results.facetValues))]):
+            text = self.results.data[i]
+            print(f"\n📄 Text {i+1}: {text[:150]}{'...' if len(text) > 150 else ''}")
+            print("-" * 80)
+            for fv in facet_data.facetValues:
+                print(f"   • {fv.facet.name}: {fv.value}")
+
+        print("\n" + "="*80)
+        print("✓ Analysis complete!")
+        print("="*80)
