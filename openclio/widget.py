@@ -167,10 +167,8 @@ class ClioWidget:
 
             # Use matplotlib for reliable rendering in widgets
             import matplotlib.pyplot as plt
-            from matplotlib.figure import Figure
 
-            fig = Figure(figsize=(8, 6))
-            ax = fig.add_subplot(111)
+            fig, ax = plt.subplots(figsize=(8, 6))
 
             # Plot all points
             ax.scatter(umap_coords[:, 0], umap_coords[:, 1],
@@ -188,10 +186,9 @@ class ClioWidget:
             ax.legend()
             ax.grid(True, alpha=0.3)
 
-            # Display using plt
             plt.tight_layout()
-            display(fig)
-            plt.close(fig)
+            plt.show()
+            plt.close()
 
     def _update_tree(self):
         """Update hierarchy tree view"""
