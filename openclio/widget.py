@@ -28,13 +28,16 @@ def test_widget_components():
         print(f"✗ Basic ipywidgets failed: {e}\n")
         return
 
-    print("\n2. Testing Plotly rendered as HTML directly...")
+    print("\n2. Testing Plotly with offline renderer...")
     try:
+        import plotly.offline as pyo
         from IPython.display import HTML as IPyHTML
+
         fig = go.Figure(data=[go.Scatter(x=[1, 2, 3], y=[4, 5, 6], mode='markers', marker=dict(size=10, color='blue'))])
         fig.update_layout(title="Test Plot - Should Be Interactive", width=400, height=300)
-        html_str = fig.to_html(include_plotlyjs='cdn', config={'displayModeBar': True})
-        print(f"✓ Generated Plotly HTML ({len(html_str)} chars) - plot should appear below:")
+
+        html_str = pyo.plot(fig, include_plotlyjs='cdn', output_type='div')
+        print(f"✓ Generated Plotly div ({len(html_str)} chars) - plot should appear below:")
         display(IPyHTML(html_str))
     except Exception as e:
         print(f"✗ Plotly rendering failed: {e}")
@@ -200,9 +203,12 @@ class ClioWidget:
                 hovermode='closest'
             )
 
-            # Render to HTML and display using IPython's HTML
+            # Use plotly offline renderer with full HTML embedding
+            import plotly.offline as pyo
             from IPython.display import HTML as IPyHTML
-            html_str = fig.to_html(include_plotlyjs='cdn', div_id=f"plot_{id(self)}")
+
+            # Generate full standalone HTML with plotly.js embedded
+            html_str = pyo.plot(fig, include_plotlyjs='cdn', output_type='div')
             display(IPyHTML(html_str))
 
     def _update_tree(self):
