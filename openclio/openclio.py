@@ -138,6 +138,15 @@ def runClio(facets: List[Facet],
     def getResults():
         nonlocal data
         nonlocal dependencyModified
+
+        # Filter out None values from data
+        cfg.print("Filtering data")
+        original_count = len(data)
+        data = [d for d in data if d is not None]
+        filtered_count = original_count - len(data)
+        if filtered_count > 0:
+            cfg.print(f"Filtered out {filtered_count} None values from data")
+
         cfg.print("Deduping data")
         if cfg.dedupData:
             dedupKeyFunc = cfg.dedupKeyFunc
@@ -145,7 +154,7 @@ def runClio(facets: List[Facet],
                 if len(data) > 0 and isinstance(data[0], str):
                     # For text data, use string identity
                     cfg.print("Using text dedup (string comparison)")
-                    dedupKeyFunc = lambda x: x.strip().lower()
+                    dedupKeyFunc = lambda x: x.strip().lower() if x else ""
                 elif len(data) > 0 and type(data[0]) in [list, np.ndarray, pd.core.series.Series]:
                     # Legacy conversation format - tokenize and truncate
                     tokenizer = llm.get_tokenizer()
@@ -154,7 +163,7 @@ def runClio(facets: List[Facet],
                 else:
                     # Generic fallback
                     cfg.print("Using identity dedup key func")
-                    dedupKeyFunc = lambda x: str(x)
+                    dedupKeyFunc = lambda x: str(x) if x else ""
             data, dependencyModified = runIfNotExist("dedupedData.pkl", lambda:
                 dedup(data, dedupKeyFunc=dedupKeyFunc, batchSize=cfg.llmBatchSize, verbose=cfg.verbose),
                 dependencyModified=dependencyModified
