@@ -227,6 +227,29 @@ class ClioWidget:
 
     def display(self):
         """Display the widget"""
+        # Check if we have any facets with clusters
+        has_clusters = any(
+            shouldMakeFacetClusters(f) and self.results.rootClusters[i] is not None
+            for i, f in enumerate(self.results.facets)
+        )
+
+        if not has_clusters:
+            print("⚠️  No clusters were generated. This might happen with very small datasets.")
+            print(f"   Total data points: {len(self.results.data)}")
+            print(f"   Facets analyzed: {', '.join([f.name for f in self.results.facets])}")
+            print("\n" + "="*80)
+            print("Facet values extracted (showing first 5):")
+            print("="*80)
+            for i, facet_data in enumerate(self.results.facetValues[:min(5, len(self.results.facetValues))]):
+                text = self.results.data[i]
+                print(f"\n📄 Text {i+1}: {text[:150]}{'...' if len(text) > 150 else ''}")
+                print("-" * 80)
+                for fv in facet_data.facetValues:
+                    print(f"   • {fv.facet.name}: {fv.value}")
+            print("\n" + "="*80)
+            print(f"✓ Analysis complete! {len(self.results.facetValues)} texts processed.")
+            return
+
         # Layout
         left_panel = VBox([
             HBox([self.facet_dropdown]),
