@@ -110,16 +110,16 @@ class VertexLLMInterface(LLMInterface):
         try:
             # Use structured output if schema provided
             if response_schema is not None:
-                config = {
-                    "response_mime_type": "application/json",
-                    "response_schema": response_schema,
-                }
-                from vertexai.generative_models import GenerationConfig
-                generation_config = GenerationConfig(**config)
+                # Convert Pydantic model to schema dict
+                schema_dict = response_schema.model_json_schema()
 
+                # Generate content with structured output
                 response = self.model.generate_content(
                     prompt,
-                    generation_config=generation_config,
+                    generation_config={
+                        "response_mime_type": "application/json",
+                        "response_schema": schema_dict,
+                    }
                 )
             else:
                 response = self.model.generate_content(
