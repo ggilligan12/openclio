@@ -28,16 +28,26 @@ def test_widget_components():
         print(f"✗ Basic ipywidgets failed: {e}\n")
         return
 
-    # Test 2: Plotly
-    print("2. Testing Plotly...")
+    # Test 2: Plotly FigureWidget (for ipywidgets)
+    print("2. Testing Plotly FigureWidget...")
     try:
-        fig = go.Figure(data=[go.Scatter(x=[1, 2, 3], y=[4, 5, 6], mode='markers')])
+        fig = go.FigureWidget(data=[go.Scatter(x=[1, 2, 3], y=[4, 5, 6], mode='markers')])
         fig.update_layout(title="Test Plot", width=400, height=300)
         display(fig)
-        print("✓ Plotly works\n")
+        print("✓ Plotly FigureWidget works - you should see a plot above\n")
     except Exception as e:
-        print(f"✗ Plotly failed: {e}\n")
-        return
+        print(f"✗ Plotly FigureWidget failed: {e}\n")
+        print("Trying alternative Plotly rendering...")
+        try:
+            import plotly.io as pio
+            pio.renderers.default = 'colab'
+            fig2 = go.Figure(data=[go.Scatter(x=[1, 2, 3], y=[4, 5, 6], mode='markers')])
+            fig2.update_layout(title="Test Plot Alt", width=400, height=300)
+            fig2.show()
+            print("✓ Plotly with Colab renderer works\n")
+        except Exception as e2:
+            print(f"✗ Alternative Plotly also failed: {e2}\n")
+            return
 
     # Test 3: HTML widget
     print("3. Testing HTML widget...")
@@ -49,7 +59,7 @@ def test_widget_components():
         print(f"✗ HTML widget failed: {e}\n")
         return
 
-    print("All tests passed! Widgets should work.")
+    print("All tests passed! If you can see the plot above, widgets will work.")
 
 
 class ClioWidget:
@@ -136,8 +146,8 @@ class ClioWidget:
                 print(f"No UMAP data available for facet {self.results.facets[facet_idx].name}")
                 return
 
-            # Create scatter plot using FigureWidget for ipywidgets compatibility
-            fig = go.FigureWidget()
+            # Create scatter plot - use regular Figure and let Colab handle rendering
+            fig = go.Figure()
 
             # Add all points
             fig.add_trace(go.Scatter(
@@ -179,7 +189,8 @@ class ClioWidget:
                 hovermode='closest'
             )
 
-            display(fig)
+            # Use show() instead of display() for better Colab compatibility
+            fig.show()
 
     def _update_tree(self):
         """Update hierarchy tree view"""
