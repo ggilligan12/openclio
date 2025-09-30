@@ -10,6 +10,52 @@ from pydantic import BaseModel
 from .llm_interface import LLMInterface
 
 
+def pydantic_to_vertex_schema(model: Type[BaseModel]) -> Dict[str, Any]:
+    """
+    Convert a Pydantic model to Vertex AI schema format.
+    Vertex AI expects a simplified schema without $defs and with specific type mappings.
+    """
+    schema = model.model_json_schema()
+
+    # Extract the properties and required fields
+    properties = {}
+    for field_name, field_info in schema.get("properties", {}).items():
+        field_type = field_info.get("type", "string")
+
+        # Map JSON schema types to Vertex AI types
+        vertex_type = {
+            "string": "STRING",
+            "integer": "INTEGER",
+            "number": "NUMBER",
+            "boolean": "BOOLEAN",
+            "array": "ARRAY",
+            "object": "OBJECT"
+        }.get(field_type, "STRING")
+
+        properties[field_name] = {
+            "type": vertex_type,
+            "description": field_info.get("description", "")
+        }
+
+        # Handle array items
+        if field_type == "array" and "items" in field_info:
+            items_type = field_info["items"].get("type", "string")
+            properties[field_name]["items"] = {
+                "type": {
+                    "string": "STRING",
+                    "integer": "INTEGER",
+                    "number": "NUMBER",
+                    "boolean": "BOOLEAN"
+                }.get(items_type, "STRING")
+            }
+
+    return {
+        "type": "OBJECT",
+        "properties": properties,
+        "required": schema.get("required", [])
+    }
+
+
 class VertexLLMInterface(LLMInterface):
     """
     Vertex AI implementation of LLM interface.
@@ -110,8 +156,8 @@ class VertexLLMInterface(LLMInterface):
         try:
             # Use structured output if schema provided
             if response_schema is not None:
-                # Convert Pydantic model to schema dict
-                schema_dict = response_schema.model_json_schema()
+                # Convert Pydantic model to Vertex AI schema format
+                schema_dict = pydantic_to_vertex_schema(response_schema)
 
                 # Generate content with structured output
                 response = self.model.generate_content(
