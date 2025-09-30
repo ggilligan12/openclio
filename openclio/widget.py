@@ -312,6 +312,11 @@ class ClioWidget:
         print("- Click clusters in the tree to view texts")
         print("- UMAP plot shows the distribution of all data points\n")
 
+        # Debug: check what we have
+        print(f"DEBUG: plot_output type: {type(self.plot_output)}")
+        print(f"DEBUG: tree_output type: {type(self.tree_output)}")
+        print(f"DEBUG: facet_dropdown type: {type(self.facet_dropdown)}")
+
         # Layout - use Output widgets for all components
         left_panel = VBox([
             HBox([self.facet_dropdown]),
@@ -326,6 +331,8 @@ class ClioWidget:
         ])
 
         main_layout = HBox([left_panel, right_panel])
+
+        print(f"DEBUG: About to display main_layout: {type(main_layout)}")
 
         # MUST be last - no print statements after this!
         display(main_layout)

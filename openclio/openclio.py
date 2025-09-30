@@ -254,7 +254,9 @@ def runClio(facets: List[Facet],
         from .widget import ClioWidget
         widget = ClioWidget(output)
         widget.display()
-        return output
+        # Don't return immediately - widget needs to be last output
+        # Return None so nothing else gets printed
+        return None
     elif htmlRoot is not None:
         htmlOutputPath = os.path.join(outputDirectory, htmlRoot.strip()[1:] if htmlRoot.strip().startswith("/") else htmlRoot)
         cfg.print(f"Outputting to webpage at path {htmlOutputPath}")
