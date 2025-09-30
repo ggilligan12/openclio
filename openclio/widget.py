@@ -22,44 +22,32 @@ def test_widget_components():
         test_output = Output()
         with test_output:
             print("Output widget works!")
+        print("✓ Basic ipywidgets work")
         display(VBox([test_dropdown, test_button, test_output]))
-        print("✓ Basic ipywidgets work\n")
     except Exception as e:
         print(f"✗ Basic ipywidgets failed: {e}\n")
         return
 
-    # Test 2: Plotly FigureWidget (for ipywidgets)
-    print("2. Testing Plotly FigureWidget...")
+    print("\n2. Testing Plotly FigureWidget...")
     try:
         fig = go.FigureWidget(data=[go.Scatter(x=[1, 2, 3], y=[4, 5, 6], mode='markers')])
         fig.update_layout(title="Test Plot", width=400, height=300)
+        print("✓ Plotly FigureWidget works - you should see a plot below")
         display(fig)
-        print("✓ Plotly FigureWidget works - you should see a plot above\n")
     except Exception as e:
-        print(f"✗ Plotly FigureWidget failed: {e}\n")
-        print("Trying alternative Plotly rendering...")
-        try:
-            import plotly.io as pio
-            pio.renderers.default = 'colab'
-            fig2 = go.Figure(data=[go.Scatter(x=[1, 2, 3], y=[4, 5, 6], mode='markers')])
-            fig2.update_layout(title="Test Plot Alt", width=400, height=300)
-            fig2.show()
-            print("✓ Plotly with Colab renderer works\n")
-        except Exception as e2:
-            print(f"✗ Alternative Plotly also failed: {e2}\n")
-            return
-
-    # Test 3: HTML widget
-    print("3. Testing HTML widget...")
-    try:
-        html_widget = HTML("<h4>Test HTML</h4><p>This is a test</p>")
-        display(html_widget)
-        print("✓ HTML widget works\n")
-    except Exception as e:
-        print(f"✗ HTML widget failed: {e}\n")
+        print(f"✗ Plotly FigureWidget failed: {e}")
         return
 
-    print("All tests passed! If you can see the plot above, widgets will work.")
+    print("\n3. Testing HTML widget...")
+    try:
+        html_widget = HTML("<h4>Test HTML</h4><p>This is a test</p>")
+        print("✓ HTML widget works")
+        display(html_widget)
+    except Exception as e:
+        print(f"✗ HTML widget failed: {e}")
+        return
+
+    print("\n✓ All tests passed! Widgets should work.")
 
 
 class ClioWidget:
@@ -314,6 +302,12 @@ class ClioWidget:
 
     def _display_layout(self):
         """Display the widget layout"""
+        # Instructions BEFORE widget (so widget is last output)
+        print("📊 Clio Analysis Widget")
+        print("- Select a facet from the dropdown")
+        print("- Click clusters in the tree to view texts")
+        print("- UMAP plot shows the distribution of all data points\n")
+
         # Layout - use plot_widget directly instead of Output wrapper
         left_panel = VBox([
             HBox([self.facet_dropdown]),
@@ -328,13 +322,9 @@ class ClioWidget:
         ])
 
         main_layout = HBox([left_panel, right_panel])
-        display(main_layout)
 
-        # Instructions
-        print("\n📊 Clio Analysis Widget")
-        print("- Select a facet from the dropdown")
-        print("- Click clusters in the tree to view texts")
-        print("- UMAP plot shows the distribution of all data points")
+        # MUST be last - no print statements after this!
+        display(main_layout)
 
     def _display_text_fallback(self):
         """Display results as formatted text when widgets don't work"""
