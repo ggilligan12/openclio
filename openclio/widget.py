@@ -273,7 +273,7 @@ class ClioWidget:
                 print("\n")
 
     def display(self):
-        """Display the widget"""
+        """Return the widget for display (Jupyter auto-displays returned widgets)"""
         # Check if we have any facets with clusters
         has_clusters = any(
             shouldMakeFacetClusters(f) and self.results.rootClusters[i] is not None
@@ -295,17 +295,18 @@ class ClioWidget:
                     print(f"   • {fv.facet.name}: {fv.value}")
             print("\n" + "="*80)
             print(f"✓ Analysis complete! {len(self.results.facetValues)} texts processed.")
-            return
+            return None
 
         try:
-            self._display_layout()
+            return self._create_layout()
         except Exception as e:
             print(f"\n⚠️  Widget rendering failed: {e}")
             print("Falling back to text-based display...\n")
             self._display_text_fallback()
+            return None
 
-    def _display_layout(self):
-        """Display the widget layout"""
+    def _create_layout(self):
+        """Create and return the widget layout (don't display it)"""
         # Layout - use Output widgets for all components
         left_panel = VBox([
             HBox([self.facet_dropdown]),
@@ -321,8 +322,8 @@ class ClioWidget:
 
         main_layout = HBox([left_panel, right_panel])
 
-        # Display widget - this MUST be the absolute last thing
-        display(main_layout)
+        # Return the layout - Jupyter will auto-display it
+        return main_layout
 
     def _display_text_fallback(self):
         """Display results as formatted text when widgets don't work"""

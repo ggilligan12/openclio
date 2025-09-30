@@ -252,10 +252,10 @@ def runClio(facets: List[Facet],
     if displayWidget:
         from .widget import ClioWidget
         widget = ClioWidget(output)
-        widget.display()
-        # Don't return - returning causes Jupyter to print instead of showing widget
-        # Users can access results via the last widget if needed
-        return
+        # Store results in widget so user can access them
+        widget.results = output
+        # Return widget - Jupyter will auto-display it (like embedding-atlas does)
+        return widget
     elif htmlRoot is not None:
         htmlOutputPath = os.path.join(outputDirectory, htmlRoot.strip()[1:] if htmlRoot.strip().startswith("/") else htmlRoot)
         cfg.print(f"Outputting to webpage at path {htmlOutputPath}")
