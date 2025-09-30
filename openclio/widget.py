@@ -105,13 +105,14 @@ class ClioWidget:
         )
         self.facet_dropdown.observe(self._on_facet_change, 'value')
 
-        # Output areas
-        self.plot_output = Output()
+        # Output areas (tree and text only - plot will be rendered separately)
         self.tree_output = Output()
         self.text_output = Output()
 
+        # Create initial plot widget
+        self.plot_widget = self._create_plot_widget()
+
         # Initial render
-        self._update_plot()
         self._update_tree()
         self._update_text_viewer([])
 
@@ -120,9 +121,13 @@ class ClioWidget:
         self.selected_facet_idx = change['new']
         self.selected_cluster = None
         self.selected_indices = None
-        self._update_plot()
+        # Update plot widget
+        self.plot_widget = self._create_plot_widget()
         self._update_tree()
         self._update_text_viewer([])
+        # Re-display to show updated plot
+        clear_output(wait=True)
+        self._display_layout()
 
     def _get_cluster_indices(self, cluster: ConversationCluster) -> np.ndarray:
         """Recursively get all indices belonging to a cluster"""
@@ -134,63 +139,64 @@ class ClioWidget:
                 indices.extend(self._get_cluster_indices(child))
             return np.array(indices)
 
-    def _update_plot(self):
-        """Update UMAP scatter plot"""
-        self.plot_output.clear_output(wait=True)
+    def _create_plot_widget(self):
+        """Create a FigureWidget for the UMAP plot"""
+        facet_idx = self.selected_facet_idx
+        umap_coords = self.results.umap[facet_idx]
 
-        with self.plot_output:
-            facet_idx = self.selected_facet_idx
-            umap_coords = self.results.umap[facet_idx]
+        if umap_coords is None:
+            # Return a placeholder widget
+            return HTML(f"<p>No UMAP data available for facet {self.results.facets[facet_idx].name}</p>")
 
-            if umap_coords is None:
-                print(f"No UMAP data available for facet {self.results.facets[facet_idx].name}")
-                return
+        # Create FigureWidget (this IS a widget that can be displayed)
+        fig = go.FigureWidget()
 
-            # Create scatter plot - use regular Figure and let Colab handle rendering
-            fig = go.Figure()
+        # Add all points
+        fig.add_trace(go.Scatter(
+            x=umap_coords[:, 0],
+            y=umap_coords[:, 1],
+            mode='markers',
+            marker=dict(
+                size=4,
+                color='lightblue',
+                opacity=0.6
+            ),
+            text=[f"Point {i}" for i in range(len(umap_coords))],
+            hoverinfo='text',
+            name='Data points'
+        ))
 
-            # Add all points
+        # Highlight selected cluster if any
+        if self.selected_indices is not None and len(self.selected_indices) > 0:
+            selected_coords = umap_coords[self.selected_indices]
             fig.add_trace(go.Scatter(
-                x=umap_coords[:, 0],
-                y=umap_coords[:, 1],
+                x=selected_coords[:, 0],
+                y=selected_coords[:, 1],
                 mode='markers',
                 marker=dict(
-                    size=4,
-                    color='lightblue',
-                    opacity=0.6
+                    size=6,
+                    color='red',
+                    opacity=0.8
                 ),
-                text=[f"Point {i}" for i in range(len(umap_coords))],
-                hoverinfo='text',
-                name='Data points'
+                name='Selected cluster',
+                hoverinfo='skip'
             ))
 
-            # Highlight selected cluster if any
-            if self.selected_indices is not None and len(self.selected_indices) > 0:
-                selected_coords = umap_coords[self.selected_indices]
-                fig.add_trace(go.Scatter(
-                    x=selected_coords[:, 0],
-                    y=selected_coords[:, 1],
-                    mode='markers',
-                    marker=dict(
-                        size=6,
-                        color='red',
-                        opacity=0.8
-                    ),
-                    name='Selected cluster',
-                    hoverinfo='skip'
-                ))
+        fig.update_layout(
+            title=f"UMAP Projection - {self.results.facets[facet_idx].name}",
+            xaxis_title="UMAP 1",
+            yaxis_title="UMAP 2",
+            height=500,
+            width=600,
+            hovermode='closest'
+        )
 
-            fig.update_layout(
-                title=f"UMAP Projection - {self.results.facets[facet_idx].name}",
-                xaxis_title="UMAP 1",
-                yaxis_title="UMAP 2",
-                height=500,
-                width=600,
-                hovermode='closest'
-            )
+        return fig
 
-            # Use show() instead of display() for better Colab compatibility
-            fig.show()
+    def _update_plot(self):
+        """Update the plot when cluster selection changes"""
+        # Recreate plot widget with new highlights
+        self.plot_widget = self._create_plot_widget()
 
     def _update_tree(self):
         """Update hierarchy tree view"""
@@ -300,31 +306,35 @@ class ClioWidget:
             return
 
         try:
-            # Layout
-            left_panel = VBox([
-                HBox([self.facet_dropdown]),
-                self.plot_output
-            ])
-
-            right_panel = VBox([
-                HTML("<h4>Cluster Hierarchy</h4>"),
-                self.tree_output,
-                HTML("<h4>Selected Texts</h4>"),
-                self.text_output
-            ])
-
-            main_layout = HBox([left_panel, right_panel])
-            display(main_layout)
-
-            # Instructions
-            print("\n📊 Clio Analysis Widget")
-            print("- Select a facet from the dropdown")
-            print("- Click clusters in the tree to view texts")
-            print("- UMAP plot shows the distribution of all data points")
+            self._display_layout()
         except Exception as e:
             print(f"\n⚠️  Widget rendering failed: {e}")
             print("Falling back to text-based display...\n")
             self._display_text_fallback()
+
+    def _display_layout(self):
+        """Display the widget layout"""
+        # Layout - use plot_widget directly instead of Output wrapper
+        left_panel = VBox([
+            HBox([self.facet_dropdown]),
+            self.plot_widget  # FigureWidget can be added directly to VBox
+        ])
+
+        right_panel = VBox([
+            HTML("<h4>Cluster Hierarchy</h4>"),
+            self.tree_output,
+            HTML("<h4>Selected Texts</h4>"),
+            self.text_output
+        ])
+
+        main_layout = HBox([left_panel, right_panel])
+        display(main_layout)
+
+        # Instructions
+        print("\n📊 Clio Analysis Widget")
+        print("- Select a facet from the dropdown")
+        print("- Click clusters in the tree to view texts")
+        print("- UMAP plot shows the distribution of all data points")
 
     def _display_text_fallback(self):
         """Display results as formatted text when widgets don't work"""
