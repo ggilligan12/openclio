@@ -160,7 +160,7 @@ class ClioWidget(anywidget.AnyWidget):
         # Listen for custom messages from JavaScript
         self.on_msg(self._handle_custom_msg)
 
-    def _handle_custom_msg(self, widget, content, buffers):
+    def _handle_custom_msg(self, content, buffers):
         """Handle messages from JavaScript frontend"""
         msg_type = content.get('type')
 
