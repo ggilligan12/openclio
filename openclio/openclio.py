@@ -253,8 +253,9 @@ def runClio(facets: List[Facet],
         from .widget import ClioWidget
         widget = ClioWidget(output)
         widget.display()
-        # Return output so user can access results programmatically
-        return output
+        # Don't return - returning causes Jupyter to print instead of showing widget
+        # Users can access results via the last widget if needed
+        return
     elif htmlRoot is not None:
         htmlOutputPath = os.path.join(outputDirectory, htmlRoot.strip()[1:] if htmlRoot.strip().startswith("/") else htmlRoot)
         cfg.print(f"Outputting to webpage at path {htmlOutputPath}")
