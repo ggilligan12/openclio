@@ -1,94 +1,133 @@
-"""Interactive Jupyter/Colab widget for exploring Clio results"""
+"""Interactive widget for exploring Clio results using anywidget"""
 
-import numpy as np
-from typing import List, Optional
-import plotly.graph_objects as go
-from ipywidgets import widgets, Output, VBox, HBox, HTML
-from IPython.display import display, clear_output
+import anywidget
+import traitlets
 import json
+import base64
+from io import BytesIO
+from typing import List, Optional
+import numpy as np
 
 from .opencliotypes import OpenClioResults, ConversationCluster, shouldMakeFacetClusters
 
 
-def test_widget_components():
-    """Test if widget components work - call this to debug display issues"""
-    print("Testing widget components...\n")
-
-    # Test 1: Basic ipywidgets
-    print("1. Testing basic ipywidgets...")
-    try:
-        test_button = widgets.Button(description="Test Button")
-        test_dropdown = widgets.Dropdown(options=['A', 'B', 'C'], description='Test:')
-        test_output = Output()
-        with test_output:
-            print("Output widget works!")
-        print("✓ Basic ipywidgets work")
-        display(VBox([test_dropdown, test_button, test_output]))
-    except Exception as e:
-        print(f"✗ Basic ipywidgets failed: {e}\n")
-        return
-
-    print("\n2. Testing Plotly with embedded plotly.js...")
-    try:
-        import plotly.offline as pyo
-        from IPython.display import HTML as IPyHTML
-
-        # Initialize plotly offline mode (loads plotly.js)
-        pyo.init_notebook_mode(connected=False)
-
-        fig = go.Figure(data=[go.Scatter(x=[1, 2, 3], y=[4, 5, 6], mode='markers', marker=dict(size=10, color='blue'))])
-        fig.update_layout(title="Test Plot - Should Be Interactive", width=400, height=300)
-
-        # Include full plotly.js library (not CDN)
-        html_str = pyo.plot(fig, include_plotlyjs=True, output_type='div')
-        print(f"✓ Generated Plotly div with embedded JS ({len(html_str)} chars)")
-        print("   Plot should appear below:")
-        display(IPyHTML(html_str))
-    except Exception as e:
-        print(f"✗ Plotly rendering failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return
-
-    print("\n3. Testing HTML in Output widget...")
-    try:
-        html_output = Output()
-        with html_output:
-            from IPython.display import HTML as IPyHTML
-            display(IPyHTML("<h4 style='color: blue;'>Test HTML</h4><p>This is a test</p>"))
-        print("✓ HTML in Output widget - check if HTML appears below")
-        display(html_output)
-    except Exception as e:
-        print(f"✗ HTML in Output widget failed: {e}")
-        return
-
-    print("\n4. Testing Plotly with different renderers...")
-    try:
-        import plotly.io as pio
-        print(f"Available renderers: {list(pio.renderers)}")
-        print(f"Default renderer: {pio.renderers.default}")
-
-        fig = go.Figure(data=[go.Scatter(x=[1, 2, 3], y=[4, 5, 6], mode='markers+lines', marker=dict(size=10, color='green'))])
-        fig.update_layout(title="Test Plot Direct Show", width=400, height=300)
-
-        print("✓ Calling fig.show() directly:")
-        fig.show()
-    except Exception as e:
-        print(f"✗ Plotly show() failed: {e}")
-        import traceback
-        traceback.print_exc()
-
-    print("\n✓ Tests complete!")
-
-
-class ClioWidget:
+class ClioWidget(anywidget.AnyWidget):
     """
-    Interactive widget for exploring Clio analysis results in Jupyter/Colab.
+    Interactive widget for exploring Clio analysis results.
 
-    Features:
-    - UMAP scatter plot with cluster hulls
-    - Hierarchical tree view
-    - Text viewer with facet annotations
+    Uses anywidget for cross-platform compatibility (Jupyter, Colab, VSCode).
+    """
+
+    # Widget state synchronized between Python and JavaScript
+    _facets = traitlets.List([]).tag(sync=True)
+    _selected_facet_idx = traitlets.Int(0).tag(sync=True)
+    _plot_data = traitlets.Unicode("").tag(sync=True)  # Base64 encoded plot image
+    _clusters = traitlets.List([]).tag(sync=True)
+    _texts = traitlets.List([]).tag(sync=True)
+
+    # Simple HTML/JS for the widget (no external files needed)
+    _esm = """
+    function render({ model, el }) {
+        // Create container
+        el.innerHTML = `
+            <div style="display: flex; gap: 20px; font-family: sans-serif;">
+                <div style="flex: 1;">
+                    <div style="margin-bottom: 10px;">
+                        <label>Facet: </label>
+                        <select id="facet-select" style="padding: 5px; font-size: 14px;"></select>
+                    </div>
+                    <div id="plot-container" style="width: 100%; max-width: 600px;"></div>
+                </div>
+                <div style="flex: 1; overflow-y: auto; max-height: 600px;">
+                    <h4>Cluster Hierarchy</h4>
+                    <div id="cluster-tree" style="font-size: 13px;"></div>
+                    <h4 style="margin-top: 20px;">Selected Texts</h4>
+                    <div id="text-viewer" style="font-size: 12px;"></div>
+                </div>
+            </div>
+        `;
+
+        const facetSelect = el.querySelector('#facet-select');
+        const plotContainer = el.querySelector('#plot-container');
+        const clusterTree = el.querySelector('#cluster-tree');
+        const textViewer = el.querySelector('#text-viewer');
+
+        // Populate facet dropdown
+        function updateFacetDropdown() {
+            const facets = model.get('_facets');
+            facetSelect.innerHTML = facets.map((f, i) =>
+                `<option value="${i}">${f}</option>`
+            ).join('');
+            facetSelect.value = model.get('_selected_facet_idx');
+        }
+
+        // Update plot
+        function updatePlot() {
+            const plotData = model.get('_plot_data');
+            if (plotData) {
+                plotContainer.innerHTML = `<img src="${plotData}" style="max-width: 100%; height: auto;" />`;
+            } else {
+                plotContainer.innerHTML = '<p>No plot available</p>';
+            }
+        }
+
+        // Update cluster tree
+        function updateClusters() {
+            const clusters = model.get('_clusters');
+            if (clusters && clusters.length > 0) {
+                clusterTree.innerHTML = clusters.map((cluster, i) =>
+                    `<div style="margin: 5px 0; padding: 5px; cursor: pointer; border: 1px solid #ddd; border-radius: 3px;"
+                          onmouseover="this.style.backgroundColor='#f0f0f0'"
+                          onmouseout="this.style.backgroundColor='white'"
+                          onclick="selectCluster(${i})">
+                        ${cluster.name} (${cluster.count} items)
+                    </div>`
+                ).join('');
+            } else {
+                clusterTree.innerHTML = '<p>No clusters available</p>';
+            }
+        }
+
+        // Update text viewer
+        function updateTexts() {
+            const texts = model.get('_texts');
+            if (texts && texts.length > 0) {
+                textViewer.innerHTML = texts.map((text, i) =>
+                    `<div style="margin: 10px 0; padding: 10px; background: #f9f9f9; border-radius: 3px;">
+                        <strong>Text ${i + 1}:</strong><br/>
+                        ${text.substring(0, 200)}${text.length > 200 ? '...' : ''}
+                    </div>`
+                ).join('');
+            } else {
+                textViewer.innerHTML = '<p>Select a cluster to view texts</p>';
+            }
+        }
+
+        // Global function for cluster selection
+        window.selectCluster = function(idx) {
+            model.send({ type: 'select_cluster', cluster_idx: idx });
+        };
+
+        // Event listeners
+        facetSelect.addEventListener('change', (e) => {
+            model.set('_selected_facet_idx', parseInt(e.target.value));
+            model.save_changes();
+        });
+
+        // Initial render
+        updateFacetDropdown();
+        updatePlot();
+        updateClusters();
+        updateTexts();
+
+        // Listen for changes
+        model.on('change:_facets', updateFacetDropdown);
+        model.on('change:_plot_data', updatePlot);
+        model.on('change:_clusters', updateClusters);
+        model.on('change:_texts', updateTexts);
+    }
+
+    export default { render };
     """
 
     def __init__(self, results: OpenClioResults):
@@ -100,8 +139,7 @@ class ClioWidget:
         """
         self.results = results
         self.selected_facet_idx = 0
-        self.selected_cluster = None
-        self.selected_indices = None
+        self.selected_cluster_indices = None
 
         # Find first facet with clusters
         for i, facet in enumerate(results.facets):
@@ -109,39 +147,93 @@ class ClioWidget:
                 self.selected_facet_idx = i
                 break
 
-        # Create widgets
-        self._create_widgets()
+        # Set initial state
+        self._facets = [f.name for f in results.facets if shouldMakeFacetClusters(f)]
+        self._selected_facet_idx = self.selected_facet_idx
 
-    def _create_widgets(self):
-        """Create all widget components"""
-        # Facet selector dropdown
-        facet_names = [f.name for f in self.results.facets if shouldMakeFacetClusters(f)]
-        self.facet_dropdown = widgets.Dropdown(
-            options=[(name, i) for i, name in enumerate(facet_names)],
-            value=self.selected_facet_idx,
-            description='Facet:',
-            style={'description_width': 'initial'}
-        )
-        self.facet_dropdown.observe(self._on_facet_change, 'value')
-
-        # Output areas for all components
-        self.plot_output = Output()
-        self.tree_output = Output()
-        self.text_output = Output()
-
-        # Initial render
+        # Generate initial plot
         self._update_plot()
-        self._update_tree()
-        self._update_text_viewer([])
+        self._update_clusters()
 
-    def _on_facet_change(self, change):
-        """Handle facet selection change"""
-        self.selected_facet_idx = change['new']
-        self.selected_cluster = None
-        self.selected_indices = None
-        self._update_plot()
-        self._update_tree()
-        self._update_text_viewer([])
+        super().__init__()
+
+        # Listen for custom messages from JavaScript
+        self.on_msg(self._handle_custom_msg)
+
+    def _handle_custom_msg(self, widget, content, buffers):
+        """Handle messages from JavaScript frontend"""
+        msg_type = content.get('type')
+
+        if msg_type == 'select_cluster':
+            cluster_idx = content.get('cluster_idx')
+            self._on_cluster_selected(cluster_idx)
+
+    def _update_plot(self):
+        """Generate plot as base64-encoded PNG"""
+        import matplotlib.pyplot as plt
+
+        facet_idx = self.selected_facet_idx
+        umap_coords = self.results.umap[facet_idx]
+
+        if umap_coords is None:
+            self._plot_data = ""
+            return
+
+        # Create matplotlib plot
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        # Plot all points
+        ax.scatter(umap_coords[:, 0], umap_coords[:, 1],
+                  c='lightblue', s=20, alpha=0.6, label='Data points')
+
+        # Highlight selected cluster if any
+        if self.selected_cluster_indices is not None and len(self.selected_cluster_indices) > 0:
+            selected_coords = umap_coords[self.selected_cluster_indices]
+            ax.scatter(selected_coords[:, 0], selected_coords[:, 1],
+                      c='red', s=40, alpha=0.8, label='Selected', edgecolors='darkred')
+
+        ax.set_xlabel('UMAP 1')
+        ax.set_ylabel('UMAP 2')
+        ax.set_title(f"UMAP Projection - {self.results.facets[facet_idx].name}")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        # Convert to base64
+        buf = BytesIO()
+        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        buf.seek(0)
+        img_base64 = base64.b64encode(buf.read()).decode('utf-8')
+        self._plot_data = f"data:image/png;base64,{img_base64}"
+
+        plt.close(fig)
+
+    def _update_clusters(self):
+        """Update cluster list"""
+        facet_idx = self.selected_facet_idx
+        root_clusters = self.results.rootClusters[facet_idx]
+
+        if root_clusters is None:
+            self._clusters = []
+            return
+
+        # Flatten cluster hierarchy for simple display
+        cluster_list = []
+
+        def add_cluster(cluster, depth=0):
+            indices = self._get_cluster_indices(cluster)
+            cluster_list.append({
+                'name': '  ' * depth + cluster.name,
+                'count': len(indices),
+                'indices': indices.tolist()
+            })
+            if cluster.children:
+                for child in cluster.children:
+                    add_cluster(child, depth + 1)
+
+        for root_cluster in root_clusters:
+            add_cluster(root_cluster)
+
+        self._clusters = cluster_list
 
     def _get_cluster_indices(self, cluster: ConversationCluster) -> np.ndarray:
         """Recursively get all indices belonging to a cluster"""
@@ -153,221 +245,61 @@ class ClioWidget:
                 indices.extend(self._get_cluster_indices(child))
             return np.array(indices)
 
-    def _update_plot(self):
-        """Update UMAP scatter plot using matplotlib (static but works in widgets)"""
-        self.plot_output.clear_output(wait=True)
+    def _on_cluster_selected(self, cluster_idx):
+        """Handle cluster selection"""
+        if cluster_idx < len(self._clusters):
+            cluster = self._clusters[cluster_idx]
+            self.selected_cluster_indices = np.array(cluster['indices'])
 
-        with self.plot_output:
-            facet_idx = self.selected_facet_idx
-            umap_coords = self.results.umap[facet_idx]
+            # Update plot with highlighted cluster
+            self._update_plot()
 
-            if umap_coords is None:
-                print(f"No UMAP data available for facet {self.results.facets[facet_idx].name}")
-                return
+            # Update texts
+            texts = []
+            for idx in cluster['indices'][:10]:  # Show first 10
+                if idx < len(self.results.data):
+                    texts.append(self.results.data[idx])
 
-            # Use matplotlib for reliable rendering in widgets
-            import matplotlib.pyplot as plt
+            self._texts = texts
 
-            fig, ax = plt.subplots(figsize=(8, 6))
+    @traitlets.observe('_selected_facet_idx')
+    def _on_facet_change(self, change):
+        """Handle facet selection change"""
+        self.selected_facet_idx = change['new']
+        self.selected_cluster_indices = None
+        self._update_plot()
+        self._update_clusters()
+        self._texts = []
 
-            # Plot all points
-            ax.scatter(umap_coords[:, 0], umap_coords[:, 1],
-                      c='lightblue', s=20, alpha=0.6, label='Data points')
 
-            # Highlight selected cluster if any
-            if self.selected_indices is not None and len(self.selected_indices) > 0:
-                selected_coords = umap_coords[self.selected_indices]
-                ax.scatter(selected_coords[:, 0], selected_coords[:, 1],
-                          c='red', s=40, alpha=0.8, label='Selected cluster', edgecolors='darkred')
+def test_widget_components():
+    """Test if anywidget works in this environment"""
+    print("Testing anywidget...")
 
-            ax.set_xlabel('UMAP 1')
-            ax.set_ylabel('UMAP 2')
-            ax.set_title(f"UMAP Projection - {self.results.facets[facet_idx].name}")
-            ax.legend()
-            ax.grid(True, alpha=0.3)
+    try:
+        import anywidget
+        import traitlets
 
-            plt.tight_layout()
-            plt.show()
-            plt.close()
+        class TestWidget(anywidget.AnyWidget):
+            _value = traitlets.Int(0).tag(sync=True)
+            _esm = """
+            function render({ model, el }) {
+                el.innerHTML = '<div style="padding: 20px; background: #e3f2fd; border-radius: 5px;"><h3>✓ anywidget works!</h3><p>The widget system is functional.</p></div>';
+            }
+            export default { render };
+            """
 
-    def _update_tree(self):
-        """Update hierarchy tree view"""
-        self.tree_output.clear_output(wait=True)
+        print("✓ anywidget imported successfully")
+        print("Creating test widget...")
 
-        with self.tree_output:
-            facet_idx = self.selected_facet_idx
-            root_clusters = self.results.rootClusters[facet_idx]
+        test = TestWidget()
+        print("✓ Test widget created")
+        print("\nWidget should appear below:")
 
-            if root_clusters is None:
-                print(f"No clusters available for facet {self.results.facets[facet_idx].name}")
-                return
+        return test
 
-            tree_widgets = []
-
-            def render_cluster(cluster: ConversationCluster, depth: int = 0):
-                indices = self._get_cluster_indices(cluster)
-                count = len(indices)
-                indent = "  " * depth
-
-                # Create button for this cluster
-                button_text = f"{indent}{'└─' if depth > 0 else '▶'} {cluster.name} ({count})"
-                btn = widgets.Button(
-                    description=button_text,
-                    layout=widgets.Layout(width='100%', margin='1px'),
-                    button_style='',
-                    tooltip=f'Click to view {count} texts',
-                    style={'button_color': '#f8f9fa' if depth == 0 else '#ffffff'}
-                )
-
-                # Store indices with button for callback
-                def on_click(b, cluster_indices=indices.tolist()):
-                    self.selected_indices = np.array(cluster_indices)
-                    self._update_plot()
-                    self._update_text_viewer(cluster_indices)
-
-                btn.on_click(on_click)
-                tree_widgets.append(btn)
-
-                # Render children
-                if cluster.children:
-                    for child in cluster.children:
-                        render_cluster(child, depth + 1)
-
-            for root_cluster in root_clusters:
-                render_cluster(root_cluster)
-
-            # Display all buttons
-            tree_box = VBox(tree_widgets, layout=widgets.Layout(overflow_y='auto', max_height='400px'))
-            display(tree_box)
-
-    def _update_text_viewer(self, indices: List[int], max_display: int = 20):
-        """Update text viewer to show selected data points"""
-        self.text_output.clear_output(wait=True)
-
-        with self.text_output:
-            if len(indices) == 0:
-                print("Select a cluster from the tree to view texts")
-                return
-
-            print(f"Showing {min(len(indices), max_display)} of {len(indices)} texts:\n")
-
-            for i, idx in enumerate(indices[:max_display]):
-                data_point = self.results.data[idx]
-                facet_data = self.results.facetValues[idx]
-
-                # Display text
-                if isinstance(data_point, str):
-                    # Truncate long texts
-                    text = data_point[:500] + ("..." if len(data_point) > 500 else "")
-                    print(f"--- Text {i+1} ---")
-                    print(text)
-                else:
-                    # Legacy conversation format
-                    print(f"--- Item {i+1} ---")
-                    print(str(data_point)[:500])
-
-                # Display facet values
-                print("\nFacets:")
-                for fv in facet_data.facetValues:
-                    print(f"  {fv.facet.name}: {fv.value}")
-                print("\n")
-
-    def display(self):
-        """Return the widget for display (Jupyter auto-displays returned widgets)"""
-        # Check if we have any facets with clusters
-        has_clusters = any(
-            shouldMakeFacetClusters(f) and self.results.rootClusters[i] is not None
-            for i, f in enumerate(self.results.facets)
-        )
-
-        if not has_clusters:
-            print("⚠️  No clusters were generated. This might happen with very small datasets.")
-            print(f"   Total data points: {len(self.results.data)}")
-            print(f"   Facets analyzed: {', '.join([f.name for f in self.results.facets])}")
-            print("\n" + "="*80)
-            print("Facet values extracted (showing first 5):")
-            print("="*80)
-            for i, facet_data in enumerate(self.results.facetValues[:min(5, len(self.results.facetValues))]):
-                text = self.results.data[i]
-                print(f"\n📄 Text {i+1}: {text[:150]}{'...' if len(text) > 150 else ''}")
-                print("-" * 80)
-                for fv in facet_data.facetValues:
-                    print(f"   • {fv.facet.name}: {fv.value}")
-            print("\n" + "="*80)
-            print(f"✓ Analysis complete! {len(self.results.facetValues)} texts processed.")
-            return None
-
-        try:
-            return self._create_layout()
-        except Exception as e:
-            print(f"\n⚠️  Widget rendering failed: {e}")
-            print("Falling back to text-based display...\n")
-            self._display_text_fallback()
-            return None
-
-    def _create_layout(self):
-        """Create and return the widget layout (don't display it)"""
-        # Layout - use Output widgets for all components
-        left_panel = VBox([
-            HBox([self.facet_dropdown]),
-            self.plot_output
-        ])
-
-        right_panel = VBox([
-            widgets.Label("Cluster Hierarchy"),
-            self.tree_output,
-            widgets.Label("Selected Texts"),
-            self.text_output
-        ])
-
-        main_layout = HBox([left_panel, right_panel])
-
-        # Return the layout - Jupyter will auto-display it
-        return main_layout
-
-    def _display_text_fallback(self):
-        """Display results as formatted text when widgets don't work"""
-        print("="*80)
-        print("CLIO ANALYSIS RESULTS")
-        print("="*80)
-        print(f"\nTotal texts analyzed: {len(self.results.data)}")
-        print(f"Facets: {', '.join([f.name for f in self.results.facets])}\n")
-
-        # Show cluster summaries for each facet
-        for facet_idx, facet in enumerate(self.results.facets):
-            if not shouldMakeFacetClusters(facet):
-                continue
-
-            print("\n" + "="*80)
-            print(f"FACET: {facet.name}")
-            print("="*80)
-
-            root_clusters = self.results.rootClusters[facet_idx]
-            if root_clusters:
-                print(f"\nFound {len(root_clusters)} top-level clusters:\n")
-                for i, cluster in enumerate(root_clusters):
-                    indices = self._get_cluster_indices(cluster)
-                    print(f"{i+1}. {cluster.name} ({len(indices)} texts)")
-                    if cluster.children:
-                        for child in cluster.children[:5]:  # Show first 5 children
-                            child_indices = self._get_cluster_indices(child)
-                            print(f"   └─ {child.name} ({len(child_indices)} texts)")
-                        if len(cluster.children) > 5:
-                            print(f"   └─ ... and {len(cluster.children) - 5} more")
-            else:
-                print("No clusters generated for this facet")
-
-        # Show sample facet values
-        print("\n" + "="*80)
-        print("SAMPLE FACET VALUES (first 5 texts)")
-        print("="*80)
-        for i, facet_data in enumerate(self.results.facetValues[:min(5, len(self.results.facetValues))]):
-            text = self.results.data[i]
-            print(f"\n📄 Text {i+1}: {text[:150]}{'...' if len(text) > 150 else ''}")
-            print("-" * 80)
-            for fv in facet_data.facetValues:
-                print(f"   • {fv.facet.name}: {fv.value}")
-
-        print("\n" + "="*80)
-        print("✓ Analysis complete!")
-        print("="*80)
+    except Exception as e:
+        print(f"✗ anywidget test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
