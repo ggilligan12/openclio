@@ -154,7 +154,7 @@ class ClioWidget:
             return np.array(indices)
 
     def _update_plot(self):
-        """Update UMAP scatter plot"""
+        """Update UMAP scatter plot using matplotlib (static but works in widgets)"""
         self.plot_output.clear_output(wait=True)
 
         with self.plot_output:
@@ -165,56 +165,33 @@ class ClioWidget:
                 print(f"No UMAP data available for facet {self.results.facets[facet_idx].name}")
                 return
 
-            # Create regular Figure
-            fig = go.Figure()
+            # Use matplotlib for reliable rendering in widgets
+            import matplotlib.pyplot as plt
+            from matplotlib.figure import Figure
 
-            # Add all points
-            fig.add_trace(go.Scatter(
-                x=umap_coords[:, 0],
-                y=umap_coords[:, 1],
-                mode='markers',
-                marker=dict(
-                    size=4,
-                    color='lightblue',
-                    opacity=0.6
-                ),
-                text=[f"Point {i}" for i in range(len(umap_coords))],
-                hoverinfo='text',
-                name='Data points'
-            ))
+            fig = Figure(figsize=(8, 6))
+            ax = fig.add_subplot(111)
+
+            # Plot all points
+            ax.scatter(umap_coords[:, 0], umap_coords[:, 1],
+                      c='lightblue', s=20, alpha=0.6, label='Data points')
 
             # Highlight selected cluster if any
             if self.selected_indices is not None and len(self.selected_indices) > 0:
                 selected_coords = umap_coords[self.selected_indices]
-                fig.add_trace(go.Scatter(
-                    x=selected_coords[:, 0],
-                    y=selected_coords[:, 1],
-                    mode='markers',
-                    marker=dict(
-                        size=6,
-                        color='red',
-                        opacity=0.8
-                    ),
-                    name='Selected cluster',
-                    hoverinfo='skip'
-                ))
+                ax.scatter(selected_coords[:, 0], selected_coords[:, 1],
+                          c='red', s=40, alpha=0.8, label='Selected cluster', edgecolors='darkred')
 
-            fig.update_layout(
-                title=f"UMAP Projection - {self.results.facets[facet_idx].name}",
-                xaxis_title="UMAP 1",
-                yaxis_title="UMAP 2",
-                height=500,
-                width=600,
-                hovermode='closest'
-            )
+            ax.set_xlabel('UMAP 1')
+            ax.set_ylabel('UMAP 2')
+            ax.set_title(f"UMAP Projection - {self.results.facets[facet_idx].name}")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
 
-            # Use plotly offline renderer with embedded plotly.js
-            import plotly.offline as pyo
-            from IPython.display import HTML as IPyHTML
-
-            # Generate full standalone HTML with plotly.js library embedded (not CDN)
-            html_str = pyo.plot(fig, include_plotlyjs=True, output_type='div')
-            display(IPyHTML(html_str))
+            # Display using plt
+            plt.tight_layout()
+            display(fig)
+            plt.close(fig)
 
     def _update_tree(self):
         """Update hierarchy tree view"""
