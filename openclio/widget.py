@@ -28,17 +28,19 @@ def test_widget_components():
         print(f"✗ Basic ipywidgets failed: {e}\n")
         return
 
-    print("\n2. Testing Plotly with Output widget...")
+    print("\n2. Testing Plotly rendered as HTML...")
     try:
         plot_output = Output()
         with plot_output:
+            from IPython.display import HTML as IPyHTML
             fig = go.Figure(data=[go.Scatter(x=[1, 2, 3], y=[4, 5, 6], mode='markers')])
             fig.update_layout(title="Test Plot", width=400, height=300)
-            fig.show()
-        print("✓ Plotly in Output widget - check if plot appears below")
+            html_str = fig.to_html(include_plotlyjs='cdn')
+            display(IPyHTML(html_str))
+        print("✓ Plotly rendered as HTML - check if plot appears below")
         display(plot_output)
     except Exception as e:
-        print(f"✗ Plotly in Output widget failed: {e}")
+        print(f"✗ Plotly rendering failed: {e}")
         return
 
     print("\n3. Testing HTML in Output widget...")
@@ -140,7 +142,7 @@ class ClioWidget:
                 print(f"No UMAP data available for facet {self.results.facets[facet_idx].name}")
                 return
 
-            # Create regular Figure and use show()
+            # Create regular Figure
             fig = go.Figure()
 
             # Add all points
@@ -183,8 +185,10 @@ class ClioWidget:
                 hovermode='closest'
             )
 
-            # Show inside Output widget
-            fig.show()
+            # Render to HTML and display using IPython's HTML
+            from IPython.display import HTML as IPyHTML
+            html_str = fig.to_html(include_plotlyjs='cdn', div_id=f"plot_{id(self)}")
+            display(IPyHTML(html_str))
 
     def _update_tree(self):
         """Update hierarchy tree view"""
