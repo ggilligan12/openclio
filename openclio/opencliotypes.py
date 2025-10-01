@@ -1,28 +1,36 @@
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Tuple, Callable, Any, List, TypeAlias
+from typing import Optional, Dict, Tuple, Callable, Any, List, TypeAlias, Type
 import numpy as np
 from numpy import typing as npt
+from pydantic import BaseModel
 
 from .faissKMeans import FaissKMeans
 
 EmbeddingArray: TypeAlias = npt.NDArray[np.float32]
 
-@dataclass(frozen=True) # frozen=true gives it hash and eq
-class Facet:
-    name: str #: Plan text name of the facet
-    question: str = "" #: The question we are asking about the data
-    prefill: str = "" #: Prefill for the LLM output when extracting facet information
-    summaryCriteria: Optional[str] = None #: Summary criteria when making hierarchies, this must be not None in order to build hierarchy
-    numeric: Optional[Tuple[int, int]] = None #: Either None (if not numeric), or (minValue, maxValue) if this facet extracts a numeric field
-    getFacetPrompt: Optional[Callable[[Any, "Facet", Any, "OpenClioConfig"], str]] = None #: takes in tokenizer, facet, conversation (can be anything), cfg and outputs a prompt to "extract" this facet. If None, will use prompts.getFacetPrompt from the paper
+@dataclass(frozen=True)
+class FacetMetadata:
+    """Metadata for a facet field - used for clustering configuration"""
+    name: str
+    summaryCriteria: Optional[str] = None  # If provided, will build cluster hierarchy for this facet
 
-def shouldMakeFacetClusters(facet: Facet) -> bool:
+def shouldMakeFacetClusters(facet: FacetMetadata) -> bool:
     """Returns true if we should make the cluster hierarchy for the given facet"""
     return facet.summaryCriteria is not None
 
+# Legacy Facet class - deprecated but kept for backwards compatibility
+@dataclass(frozen=True)
+class Facet:
+    name: str
+    question: str = ""
+    prefill: str = ""
+    summaryCriteria: Optional[str] = None
+    numeric: Optional[Tuple[int, int]] = None
+    getFacetPrompt: Optional[Callable[[Any, "Facet", Any, "OpenClioConfig"], str]] = None
+
 @dataclass
 class FacetValue:
-    facet: Facet
+    facet: FacetMetadata  # Changed from Facet to FacetMetadata
     value: str
 
 @dataclass
@@ -46,7 +54,7 @@ DataPointEmbedding = ConversationEmbedding
 @dataclass
 class ConversationCluster:
     """Cluster of data points with similar facet values"""
-    facet: Facet
+    facet: FacetMetadata  # Changed from Facet to FacetMetadata
     summary: str
     name: str
     children: Optional[List['ConversationCluster']] = None
@@ -150,7 +158,7 @@ class OpenClioConfig:
 @dataclass
 class OpenClioResults:
     """Results from running Clio analysis on text data"""
-    facets: List[Facet]
+    facets: List[FacetMetadata]  # Changed from List[Facet]
     facetValues: List[ConversationFacetData]
     facetValuesEmbeddings: List[Optional[EmbeddingArray]]
     baseClusters: List[Optional[List[ConversationCluster]]]

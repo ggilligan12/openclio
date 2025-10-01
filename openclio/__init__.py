@@ -6,25 +6,18 @@ from .opencliotypes import *
 from .faissKMeans import *
 from .prompts import *
 from .writeOutput import *
-from .llm_interface import LLMInterface
-from .vertex_llm import VertexLLMInterface
 from .widget import ClioWidget, test_widget_components
-from .structured_outputs import FacetAnswer, ClusterNames, DeduplicatedNames, ClusterAssignment, ClusterRenaming
 
 # Explicitly export key classes
 __all__ = [
     # Main entry point
     'runClio',
 
-    # LLM interfaces
-    'LLMInterface',
-    'VertexLLMInterface',
-
-    # Facets
-    'systemPromptFacets',
-    'mainFacets',  # alias
-    'genericSummaryFacets',
-    'Facet',
+    # Facet schemas and metadata
+    'SystemPromptFacets',
+    'systemPromptFacetMetadata',
+    'FacetMetadata',
+    'Facet',  # Legacy - kept for backwards compatibility
 
     # Data types
     'OpenClioConfig',
@@ -34,13 +27,6 @@ __all__ = [
     'ConversationCluster',
     'DataCluster',
     'FacetValue',
-
-    # Structured outputs
-    'FacetAnswer',
-    'ClusterNames',
-    'DeduplicatedNames',
-    'ClusterAssignment',
-    'ClusterRenaming',
 
     # Widget
     'ClioWidget',

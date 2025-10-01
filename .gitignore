@@ -83,6 +83,9 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# Local notebook (never commit - contains user-specific data/configs)
+notebook.ipynb
+
 # IPython
 profile_default/
 ipython_config.py

@@ -6,8 +6,9 @@ Based on [Anthropic's Clio: A system for privacy-preserving insights into real-w
 
 ## Features
 
-- **Vertex AI Integration**: Uses Google Gemini for facet extraction with structured outputs
-- **System Prompt Analysis**: Specialized facets for understanding AI agent purposes and capabilities
+- **Efficient Multi-Facet Extraction**: Extract all facets in one LLM call (N calls instead of N×M)
+- **Vertex AI Integration**: Uses Google Gemini with structured outputs (guaranteed JSON)
+- **System Prompt Analysis**: Pre-built facets for analyzing AI agent purposes and capabilities
 - **Interactive Widget**: Explore results in Jupyter/Colab with UMAP plots and hierarchical trees
 - **Automatic Clustering**: Discover patterns in thousands of system prompts
 - **Checkpointing**: Resume interrupted analyses from cached results
@@ -33,27 +34,25 @@ prompts = [
     # ... more prompts
 ]
 
-# Initialize models
-llm = openclio.VertexLLMInterface(
-    model_name="gemini-1.5-flash",
-    project_id="your-gcp-project-id"
-)
+# Initialize embedding model
 embedding_model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
 
 # Run analysis
 results = openclio.runClio(
-    facets=openclio.systemPromptFacets,
-    llm=llm,
+    facetSchema=openclio.SystemPromptFacets,
+    facetMetadata=openclio.systemPromptFacetMetadata,
     embeddingModel=embedding_model,
     data=prompts,
     outputDirectory="./output",
+    project_id="your-gcp-project-id",
+    model_name="gemini-1.5-flash-002",
     displayWidget=True,
 )
 ```
 
 ### What Gets Analyzed
 
-The default `systemPromptFacets` extract:
+The default `SystemPromptFacets` extract:
 - **Primary Purpose**: Main function or role of the AI agent
 - **Domain**: Subject area (healthcare, finance, education, etc.)
 - **Key Capabilities**: Important features and abilities
@@ -61,24 +60,26 @@ The default `systemPromptFacets` extract:
 
 ## How It Works
 
-1. **Facet Extraction**: LLM analyzes each prompt using structured outputs (guaranteed JSON)
-2. **Embedding**: Converts facet values to dense vectors
-3. **Clustering**: Groups similar prompts hierarchically
-4. **Visualization**: UMAP projection + interactive tree view
+1. **Multi-Facet Extraction**: LLM analyzes each prompt once, extracting ALL facets in a single call (4x fewer API calls for 4 facets!)
+2. **Structured Outputs**: Pydantic schemas ensure guaranteed JSON responses
+3. **Embedding**: Converts facet values to dense vectors
+4. **Clustering**: Groups similar prompts hierarchically
+5. **Visualization**: UMAP projection + interactive tree view
 
 ## Authentication
 
-OpenClio uses Application Default Credentials in Colab:
+OpenClio uses Application Default Credentials:
 
+**In Colab:**
 ```python
-# In Colab, no special auth needed - workload identity handles it
-llm = openclio.VertexLLMInterface(
-    model_name="gemini-1.5-flash",
-    project_id="your-project-id"
+# Workload identity handles auth automatically
+results = openclio.runClio(
+    project_id="your-project-id",
+    ...
 )
 ```
 
-For local development, set up ADC:
+**Local development:**
 ```bash
 gcloud auth application-default login
 ```
@@ -89,37 +90,56 @@ Key parameters in `runClio()`:
 
 ```python
 results = openclio.runClio(
-    facets=openclio.systemPromptFacets,  # What to extract
-    llm=llm,                              # LLM for analysis
-    embeddingModel=embedding_model,       # For clustering
-    data=prompts,                         # Your text data
-    outputDirectory="./output",           # Cache location
-    displayWidget=True,                   # Show interactive widget
-    llmBatchSize=10,                      # Lower for rate limits
-    maxTextChars=32000,                   # Truncate long texts
-    verbose=True,                         # Progress output
+    facetSchema=openclio.SystemPromptFacets,      # Pydantic schema defining facets
+    facetMetadata=openclio.systemPromptFacetMetadata,  # Clustering config per facet
+    embeddingModel=embedding_model,               # SentenceTransformer for clustering
+    data=prompts,                                 # Your text data
+    outputDirectory="./output",                   # Cache location
+    project_id="your-gcp-project",                # GCP project ID
+    model_name="gemini-1.5-flash-002",            # Gemini model to use
+    location="us-central1",                       # GCP region
+    displayWidget=True,                           # Show interactive widget
+    llmBatchSize=10,                              # Batch size for API calls
+    maxTextChars=32000,                           # Truncate long texts
+    verbose=True,                                 # Progress output
 )
 ```
 
 ## Custom Facets
 
-Define your own facets for domain-specific analysis:
+Define your own facets using Pydantic models:
 
 ```python
-from openclio import Facet
+from pydantic import BaseModel, Field
+from openclio import FacetMetadata
 
-custom_facets = [
-    Facet(
-        name="Security Level",
-        question="What security constraints does this agent have?",
-        prefill="The security constraints are",
-        summaryCriteria="Cluster name should describe security approach"
+class MusicFacets(BaseModel):
+    genre: str = Field(description="In the greatest degree of specificity possible, what genre of music is this")
+    language: list[str] = Field(description="What language (if any) is this music being produced in, eg. English, French, Hindi, etc.")
+    tone: str = Field(description="What is the tone of the music, eg. calm, soothing, upbeat, aggressive etc.")
+    instrumentation: str = Field(description="What instrumentation is in use, ie. Electronic, Guitar, Orchstra etc.")
+
+# Define which facets should get cluster hierarchies
+facet_metadata = {
+    "genre": FacetMetadata(
+        name="Genre",
+        summaryCriteria="Cluster name should describe the overall genre"
     ),
-    # ... more facets
-]
+    "alignment": FacetMetadata(
+        name="Tone",
+        summaryCriteria="Cluster name should describe the tone of the music"
+    ),
+    # Keywords and narrative won't get hierarchies (no metadata entry)
+}
 
-results = openclio.runClio(facets=custom_facets, ...)
+results = openclio.runClio(
+    facetSchema=MusicFacets,
+    facetMetadata=facet_metadata,
+    ...
+)
 ```
+
+**Key insight**: All facets are extracted in one LLM call, making this dramatically more efficient than the old approach!
 
 ## Widget Features
 
@@ -131,14 +151,14 @@ The interactive widget provides:
 
 ## Examples
 
-See `example_system_prompts.ipynb` for a complete walkthrough.
+See `notebook.ipynb` for a complete walkthrough with both system prompt analysis and custom facet examples.
 
 ## Performance Tips
 
-- **Batch Size**: Use `llmBatchSize=10` for Vertex AI (rate limits)
-- **Model Choice**: `gemini-1.5-flash` is fast, `gemini-1.5-pro` is more accurate
+- **Batch Size**: Use `llmBatchSize=10` for Vertex AI (rate limits ~60 req/min)
+- **Model Choice**: `gemini-1.5-flash-002` is fast and cheap, `gemini-1.5-pro` is more accurate
 - **Checkpointing**: Results cached in `outputDirectory` - rerun resumes automatically
-- **Large Datasets**: For >1000 prompts, expect 30-60 minutes with Flash
+- **Large Datasets**: For 1000 prompts with 4 facets, expect ~15-20 minutes with Flash (only 1000 calls!)
 
 ## Programmatic Access
 
@@ -154,15 +174,16 @@ for fv in prompt_facets.facetValues:
 for facet_idx, facet in enumerate(results.facets):
     root_clusters = results.rootClusters[facet_idx]
     if root_clusters:
-        print(f"\\n{facet.name} clusters:")
+        print(f"\n{facet.name} clusters:")
         for cluster in root_clusters:
             print(f"  {cluster.name} ({len(cluster.indices)} items)")
 ```
 
 ## Architecture
 
-- **LLM Interface**: Abstracts Vertex AI (supports other backends)
-- **Structured Outputs**: Pydantic models ensure correct JSON from Gemini
+- **Multi-Facet Extraction**: Single Pydantic schema extracts all facets in one LLM call
+- **Vertex AI Direct**: No abstraction layer - Gemini called directly for simplicity
+- **Structured Outputs**: Vertex AI `response_schema` ensures valid JSON
 - **Facet Pipeline**: Extract → Embed → Cluster → Hierarchy → Visualize
 - **Widget**: ipywidgets + Plotly for interactive exploration
 
@@ -182,6 +203,27 @@ for facet_idx, facet in enumerate(results.facets):
 
 **Out of memory**: Reduce `embedBatchSize` or process in smaller batches
 
+## Migration from Old API
+
+If you have existing code using the old `VertexLLMInterface`:
+
+**Old:**
+```python
+llm = openclio.VertexLLMInterface(model_name="gemini-1.5-flash", project_id="...")
+results = openclio.runClio(facets=openclio.systemPromptFacets, llm=llm, ...)
+```
+
+**New:**
+```python
+results = openclio.runClio(
+    facetSchema=openclio.SystemPromptFacets,
+    facetMetadata=openclio.systemPromptFacetMetadata,
+    project_id="...",
+    model_name="gemini-1.5-flash-002",
+    ...
+)
+```
+
 ## Citation
 
 If you use OpenClio in research, please cite the original Clio paper:
@@ -197,6 +239,22 @@ If you use OpenClio in research, please cite the original Clio paper:
 ## License
 
 MIT License - see LICENSE file
+
+## Local Development
+
+Want to contribute or develop locally? See the **`dev/`** folder:
+
+- **`dev/QUICKSTART.md`** - Get started in 5 minutes
+- **`dev/LOCAL_SETUP.md`** - Comprehensive development guide
+- **`dev/setup_dev.sh`** - One-command setup
+- **`dev/test_local.py`** - Automated tests
+
+Quick setup:
+```bash
+./dev/setup_dev.sh
+gcloud auth application-default login
+python dev/test_local.py
+```
 
 ## Contributing
 

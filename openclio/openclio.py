@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 import pandas as pd
-from typing import Any, Union, Tuple, Optional, Callable, Dict, List, TypeAlias
+from typing import Any, Union, Tuple, Optional, Callable, Dict, List, TypeAlias, Type
 import traceback
 import faiss
 import functools
@@ -21,90 +21,117 @@ import re
 import random
 import cloudpickle
 from pathlib import Path
+import time
+from pydantic import BaseModel, Field, create_model
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tqdm import tqdm
 
-from .llm_interface import LLMInterface
-from .prompts import getFacetPrompt, getFacetClusterNamePrompt, getNeighborhoodClusterNamesPrompt, getDeduplicateClusterNamesPrompt, getAssignToHighLevelClusterPrompt, getRenamingHigherLevelClusterPrompt, getSummarizeFacetPrompt, getFacetPrompt, conversationToString
-from .utils import flatten, unflatten, runBatched, dedup, runWebui
-from .opencliotypes import Facet, FacetValue, ConversationFacetData, ConversationEmbedding, ConversationCluster, OpenClioConfig, OpenClioResults, EmbeddingArray, shouldMakeFacetClusters
+from .prompts import getFacetClusterNamePrompt, getNeighborhoodClusterNamesPrompt, getDeduplicateClusterNamesPrompt, getAssignToHighLevelClusterPrompt, getRenamingHigherLevelClusterPrompt
+from .utils import flatten, unflatten, runBatched, dedup
+from .opencliotypes import FacetMetadata, FacetValue, ConversationFacetData, ConversationEmbedding, ConversationCluster, OpenClioConfig, OpenClioResults, EmbeddingArray, shouldMakeFacetClusters
 from .faissKMeans import FaissKMeans
 from .writeOutput import convertOutputToWebpage, computeUmap
-from .structured_outputs import FacetAnswer, ClusterNames, DeduplicatedNames, ClusterAssignment, ClusterRenaming
 
-# Facets for analyzing system prompts for AI agents
-systemPromptFacets = [
-    Facet(
+# System prompt facets as Pydantic model
+class SystemPromptFacets(BaseModel):
+    """Facets for analyzing AI agent system prompts"""
+    primary_purpose: str = Field(description="The primary purpose or role of the AI agent. Be clear and concise, 1-2 sentences.")
+    domain: str = Field(description="The domain or subject area the AI agent operates in (e.g., healthcare, finance, education, etc.). 1-2 sentences.")
+    key_capabilities: str = Field(description="The key capabilities or features emphasized. List the most important ones. 1-2 sentences.")
+    interaction_style: str = Field(description="The interaction style or personality the AI agent adopts (e.g., professional, casual, empathetic). 1-2 sentences.")
+
+# Metadata for system prompt facets (defines which should have cluster hierarchies)
+systemPromptFacetMetadata = {
+    "primary_purpose": FacetMetadata(
         name="Primary Purpose",
-        question="What is the primary purpose or role of the AI agent described in this system prompt?",
-        prefill="The primary purpose of this AI agent is to",
-        summaryCriteria="The cluster name should be a clear phrase describing the agent's main function or role, such as 'Customer support chatbot' or 'Code generation assistant'.",
+        summaryCriteria="The cluster name should be a clear phrase describing the agent's main function or role, such as 'Customer support chatbot' or 'Code generation assistant'."
     ),
-    Facet(
+    "domain": FacetMetadata(
         name="Domain",
-        question="What domain or subject area does this AI agent operate in? (e.g., healthcare, finance, education, general purpose, etc.)",
-        prefill="This AI agent operates in the domain of",
-        summaryCriteria="The cluster name should describe the domain or industry, such as 'Healthcare and medical advice' or 'Software development'.",
+        summaryCriteria="The cluster name should describe the domain or industry, such as 'Healthcare and medical advice' or 'Software development'."
     ),
-    Facet(
+    "key_capabilities": FacetMetadata(
         name="Key Capabilities",
-        question="What are the key capabilities or features emphasized in this system prompt? List the most important ones.",
-        prefill="The key capabilities are",
-        summaryCriteria="The cluster name should summarize the main capabilities, such as 'Multi-language translation and cultural adaptation' or 'Data analysis and visualization'.",
+        summaryCriteria="The cluster name should summarize the main capabilities, such as 'Multi-language translation and cultural adaptation' or 'Data analysis and visualization'."
     ),
-    Facet(
+    "interaction_style": FacetMetadata(
         name="Interaction Style",
-        question="What interaction style or personality is the AI agent instructed to adopt? (e.g., professional, casual, empathetic, technical, etc.)",
-        prefill="The interaction style is",
-        summaryCriteria="The cluster name should describe the tone and manner, such as 'Professional and concise' or 'Friendly and conversational'.",
+        summaryCriteria="The cluster name should describe the tone and manner, such as 'Professional and concise' or 'Friendly and conversational'."
     ),
-]
-
-# Deprecated - kept for backwards compatibility
-mainFacets = systemPromptFacets
-
-genericSummaryFacets = [
-    Facet(
-        name="Summary",
-        getFacetPrompt=functools.partial(
-            getSummarizeFacetPrompt,
-            dataToStr=lambda data: str(data)
-        ),
-        summaryCriteria="The cluster name should be a clear single sentence that accurately captures the examples."
-    )
-]
+}
 
 
-def runClio(facets: List[Facet],
-            llm: LLMInterface,
+# Vertex AI helper functions
+def pydantic_to_vertex_schema(model: Type[BaseModel]) -> Dict[str, Any]:
+    """Convert a Pydantic model to Vertex AI schema format"""
+    schema = model.model_json_schema()
+    properties = {}
+    for field_name, field_info in schema.get("properties", {}).items():
+        field_type = field_info.get("type", "string")
+        vertex_type = {
+            "string": "STRING",
+            "integer": "INTEGER",
+            "number": "NUMBER",
+            "boolean": "BOOLEAN",
+            "array": "ARRAY",
+            "object": "OBJECT"
+        }.get(field_type, "STRING")
+
+        properties[field_name] = {
+            "type": vertex_type,
+            "description": field_info.get("description", "")
+        }
+
+        if field_type == "array" and "items" in field_info:
+            items_type = field_info["items"].get("type", "string")
+            properties[field_name]["items"] = {
+                "type": {"string": "STRING", "integer": "INTEGER", "number": "NUMBER", "boolean": "BOOLEAN"}.get(items_type, "STRING")
+            }
+
+    return {
+        "type": "OBJECT",
+        "properties": properties,
+        "required": schema.get("required", [])
+    }
+
+
+def runClio(
+            facetSchema: Type[BaseModel],
+            facetMetadata: Dict[str, FacetMetadata],
             embeddingModel: SentenceTransformer,
             data: List[str],
             outputDirectory: str,
+            project_id: str,
+            model_name: str = "gemini-1.5-flash-002",
+            location: str = "us-central1",
             htmlRoot: str = None,
             displayWidget: bool = False,
             cfg: OpenClioConfig = None,
             **kwargs
         ) -> OpenClioResults:
     """
-    Runs the Clio algorithm on text data, using the given llm and embeddingModel.
-
-    Clio extracts facets from each text, then for some of those facets it generates a hierarchy you can view.
+    Runs the Clio algorithm on text data using Vertex AI and embeddings.
 
     Keyword arguments:
-    facets -- The facets we will extract from each text. Use facets=openclio.systemPromptFacets to analyze system prompts.
-    llm -- The llm that is used to extract facets and cluster data. This should be an LLMInterface instance (e.g., VertexLLMInterface)
-    embeddingModel -- The embedding model used for clustering data. This should be a SentenceTransformer instance
-    data -- The text data we are running clio on. Each element should be a string.
-    outputDirectory -- The directory path where we store checkpoints/outputs
-    htmlRoot -- (Optional) The path where the visuals will be stored on your website. For example, "/opencliooutputs". If None and displayWidget=False, no output is generated.
-    displayWidget -- (Default: False) If True, displays an interactive widget in Jupyter/Colab. If False, generates web files if htmlRoot is provided.
-    cfg -- Optional, an instance of openclio.OpenClioConfig, this lets you modify some of openclio's settings.
-    Any extra args you provide will be assigned to your OpenClioConfig
+    facetSchema -- Pydantic BaseModel defining all facets to extract (e.g., SystemPromptFacets)
+    facetMetadata -- Dict mapping field names to FacetMetadata (defines which facets get cluster hierarchies)
+    embeddingModel -- SentenceTransformer for clustering
+    data -- List of text strings to analyze
+    outputDirectory -- Where to store checkpoints/outputs
+    project_id -- GCP project ID for Vertex AI
+    model_name -- Vertex AI model (default: gemini-1.5-flash-002)
+    location -- GCP region (default: us-central1)
+    htmlRoot -- (Optional) Web output path
+    displayWidget -- (Default: False) Show interactive widget in Jupyter/Colab
+    cfg -- Optional OpenClioConfig for advanced settings
+
     Returns:
-    An OpenClioResults object that contains the results of Clio.
+    OpenClioResults object (or ClioWidget if displayWidget=True)
     """
 
     # make the output directory to store checkpoints if it does not exist
     Path(outputDirectory).mkdir(parents=True, exist_ok=True)
-    
+
     if cfg is None:
         cfg = OpenClioConfig(**kwargs)
     else:
@@ -113,9 +140,25 @@ def runClio(facets: List[Facet],
                 cfg.k = v
             else:
                 raise ValueError(f"Unknown OpenClioConfig key {k} with value {v}")
-    
+
     cfg.print = print if cfg.verbose else lambda *a, **b: None
     cfg.kmeansArgs['verbose'] = cfg.verbose
+
+    # Initialize Vertex AI
+    try:
+        import vertexai
+        from vertexai.generative_models import GenerativeModel
+        vertexai.init(project=project_id, location=location)
+        vertex_model = GenerativeModel(model_name)
+        cfg.print(f"Initialized Vertex AI with model {model_name}")
+    except ImportError:
+        raise ImportError("Vertex AI dependencies not installed. Install with: pip install google-cloud-aiplatform")
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize Vertex AI: {e}")
+
+    # Convert facetMetadata dict to list in consistent order
+    facet_field_names = list(facetSchema.model_fields.keys())
+    facets = [facetMetadata[field_name] for field_name in facet_field_names]
 
     dependencyModified = False
     def runIfNotExist(path, runFunc, dependencyModified):
@@ -151,19 +194,9 @@ def runClio(facets: List[Facet],
         if cfg.dedupData:
             dedupKeyFunc = cfg.dedupKeyFunc
             if dedupKeyFunc is None:
-                if len(data) > 0 and isinstance(data[0], str):
-                    # For text data, use string identity
-                    cfg.print("Using text dedup (string comparison)")
-                    dedupKeyFunc = lambda x: x.strip().lower() if x else ""
-                elif len(data) > 0 and type(data[0]) in [list, np.ndarray, pd.core.series.Series]:
-                    # Legacy conversation format - tokenize and truncate
-                    tokenizer = llm.get_tokenizer()
-                    cfg.print("Using conversation dedup key func")
-                    dedupKeyFunc = lambda conversation: conversationToString(conversation, tokenizer=tokenizer, maxTokens=cfg.maxTextChars)
-                else:
-                    # Generic fallback
-                    cfg.print("Using identity dedup key func")
-                    dedupKeyFunc = lambda x: str(x) if x else ""
+                # For text data, use string comparison
+                cfg.print("Using text dedup (string comparison)")
+                dedupKeyFunc = lambda x: x.strip().lower() if x else ""
             data, dependencyModified = runIfNotExist("dedupedData.pkl", lambda:
                 dedup(data, dedupKeyFunc=dedupKeyFunc, batchSize=cfg.llmBatchSize, verbose=cfg.verbose),
                 dependencyModified=dependencyModified
@@ -175,8 +208,9 @@ def runClio(facets: List[Facet],
         facetValues, dependencyModified = \
             runIfNotExist("facetValues.pkl", lambda:
                 getFacetValues(
-                    facets=facets, 
-                    llm=llm,
+                    facets=facets,
+                    facetSchema=facetSchema,
+                    vertex_model=vertex_model,
                     data=data,
                     cfg=cfg
                 ),
@@ -202,7 +236,7 @@ def runClio(facets: List[Facet],
             runIfNotExist("baseClusters.pkl", lambda:
                 getBaseClusters(
                     facets=facets,
-                    llm=llm,
+                    vertex_model=vertex_model,
                     embeddingModel=embeddingModel,
                     facetValues=facetValues,
                     facetValuesEmbeddings=facetValuesEmbeddings,
@@ -212,14 +246,14 @@ def runClio(facets: List[Facet],
                 ),
                 dependencyModified=dependencyModified
             )
-        
+
         cfg.print("Getting higher level clusters")
         setSeed(cfg.seed)
         rootClusters, dependencyModified = \
             runIfNotExist("rootClusters.pkl", lambda:
                 getHierarchy(
                     facets=facets,
-                    llm=llm,
+                    vertex_model=vertex_model,
                     embeddingModel=embeddingModel,
                     baseClusters=baseClusters,
                     cfg=cfg
@@ -235,7 +269,7 @@ def runClio(facets: List[Facet],
                     data=data,
                     facetValuesEmbeddings=facetValuesEmbeddings,
                     embeddingModel=embeddingModel,
-                    tokenizer=llm.get_tokenizer(),
+                    tokenizer=None,  # No tokenizer with Vertex AI
                     cfg=cfg
                 ),
                 dependencyModified=dependencyModified
@@ -349,32 +383,43 @@ def getNeighborhoods(
     return kmeans, facetNeighborhoods
 
 def getHierarchy(
-    facets: List[Facet],
-    llm: LLMInterface,
+    facets: List[FacetMetadata],
+    vertex_model: Any,
     embeddingModel: SentenceTransformer,
     baseClusters: List[Optional[List[ConversationCluster]]],
     cfg: OpenClioConfig) -> List[Optional[List[ConversationCluster]]]:
     """
-    Extracts a hierarchy of labels, starting with baseClusters at the lowest level
-    1. Get "neighborhoods" composed of 
-    k = cfg.nAverageClustersPerNeighborhood(numValues)
-    clusters via embedding cluster names and summaries, and adding cfg.nSamplesOutsideNeighborhood extra closest to but outside of the kmeans cluster.
-    2. Gets roughly cfg.nDesiredHigherLevelNamesPerClusterFunc(len(neighborhood)) names from each of those neighborhoods using llm
-    3. Dedups those names using llm
-    4. Assigns each lower level cluster to the possible higher level clusters, using llm
-    5. Renames the higher level clusters based on what got added to them, using llm
-    Repeats 1-5 until we have len(currentLevel) <= cfg.minTopLevelSize
-
+    Extracts a hierarchy of labels, starting with baseClusters at the lowest level.
     Returns a list one element per facet.
-    That element will be None if shouldMakeFacetClusters(facet) is False, otherwise
-    That element will be a list of the top level ConversationClusters
-    You can use children to traverse.
     """
     seed = cfg.seed
+
     def processBatchFuncLLM(prompts: List[str]) -> List[str]:
-        nonlocal seed # we increment it so duplicate entries will get distinct things
+        nonlocal seed
         seed += 1
-        return llm.generate_batch(prompts, **cfg.llmExtraInferenceArgs) 
+        results = []
+        for prompt in prompts:
+            try:
+                response = vertex_model.generate_content(
+                    prompt,
+                    generation_config={
+                        "max_output_tokens": cfg.llmExtraInferenceArgs.get("max_tokens", 1000),
+                        "temperature": cfg.llmExtraInferenceArgs.get("temperature", 0.7),
+                        "top_p": cfg.llmExtraInferenceArgs.get("top_p", 0.8),
+                        "top_k": cfg.llmExtraInferenceArgs.get("top_k", 40),
+                    }
+                )
+                if hasattr(response, 'text'):
+                    results.append(response.text)
+                elif hasattr(response, 'candidates') and len(response.candidates) > 0:
+                    results.append(response.candidates[0].content.parts[0].text)
+                else:
+                    results.append("")
+            except Exception as e:
+                cfg.print(f"Error in LLM call: {e}")
+                results.append("")
+            time.sleep(60.0 / 60)  # Rate limiting
+        return results 
     
     topLevelParents = []
     for facetI, facet in enumerate(facets):
@@ -402,13 +447,12 @@ def getHierarchy(
             #### Get higher level category names ####
 
             cfg.print("getting higher level category names")
-            tokenizer = llm.get_tokenizer()
             def getInputsFunc(clusterIndicesInNeighborhood: Sources) -> str:
                 clustersInNeighborhood = [curLevelFacetClusters[i] for i in clusterIndicesInNeighborhood]
                 clusterNamePrompts = []
                 for _ in range(2):
                     random.shuffle(clustersInNeighborhood)# shuffle ordering
-                    clusterNamePrompts.append(getNeighborhoodClusterNamesPrompt(facet, tokenizer, clustersInNeighborhood, cfg.nDesiredHigherLevelNamesPerClusterFunc(len(clustersInNeighborhood)), tokenizerArgs=cfg.tokenizerArgs))
+                    clusterNamePrompts.append(getNeighborhoodClusterNamesPrompt(facet, None, clustersInNeighborhood, cfg.nDesiredHigherLevelNamesPerClusterFunc(len(clustersInNeighborhood)), tokenizerArgs=cfg.tokenizerArgs))
                 return clusterNamePrompts                    
             
             def processOutputFunc(clusterIndicesInNeighborhood: Sources, clusterNamePrompts: str, clusterNamesOutputs: str) -> List[Tuple[str, Sources]]:
@@ -436,11 +480,11 @@ def getHierarchy(
                 # shuffle ordering
                 while True:
                     random.shuffle(clustersInNeighborhood)
-                    prompt = getNeighborhoodClusterNamesPrompt(facet, tokenizer, clustersInNeighborhood, cfg.nDesiredHigherLevelNamesPerClusterFunc(len(clustersInNeighborhood)), tokenizerArgs=cfg.tokenizerArgs)
+                    prompt = getNeighborhoodClusterNamesPrompt(facet, None, clustersInNeighborhood, cfg.nDesiredHigherLevelNamesPerClusterFunc(len(clustersInNeighborhood)), tokenizerArgs=cfg.tokenizerArgs)
                     cfg.print(prompt)
-                    nonlocal seed # we increment it so duplicate entries will get distinct things
+                    nonlocal seed
                     seed += 1
-                    clusterNamesOutput = llm.generate_batch([prompt], **cfg.llmExtraInferenceArgs)[0]
+                    clusterNamesOutput = processBatchFuncLLM([prompt])[0]
                     clusterNames = extractAnswerNumberedList(clusterNamesOutput, ignoreNoTrailing=True)
                     if len(clusterNames) != 0:
                         cfg.print("Success at manual retry")
@@ -484,7 +528,7 @@ def getHierarchy(
                 targetAmount =  max(1, len(higherCategoriesInNeighborhood)//2) # aim for -1 (arbitrary), but prompt lets it do more or less as needed
                 if len(higherCategoriesInNeighborhood) == 2:
                     targetAmount = 2 # for only two, it'll mangle the categories if we ask it to dedup them into one, so don't do that
-                return getDeduplicateClusterNamesPrompt(facet, tokenizer, higherCategoriesInNeighborhood, targetAmount, tokenizerArgs=cfg.tokenizerArgs)
+                return getDeduplicateClusterNamesPrompt(facet, None, higherCategoriesInNeighborhood, targetAmount, tokenizerArgs=cfg.tokenizerArgs)
             
             def processOutputFunc(
                     higherCategoryIndicesInNeighborhoods: List[Tuple[str, Sources]],
@@ -540,7 +584,7 @@ def getHierarchy(
                 assignToHigherCategoryPrompts = []
                 for i in range(cfg.nCategorizeSamples):
                     random.shuffle(potentialHigherLevelClusters)
-                    assignToHigherCategoryPrompts.append(getAssignToHighLevelClusterPrompt(tokenizer, clusterToAssign=facetCluster, higherLevelClusters=potentialHigherLevelClusters, tokenizerArgs=cfg.tokenizerArgs))
+                    assignToHigherCategoryPrompts.append(getAssignToHighLevelClusterPrompt(None, clusterToAssign=facetCluster, higherLevelClusters=potentialHigherLevelClusters, tokenizerArgs=cfg.tokenizerArgs))
                 return assignToHigherCategoryPrompts
 
             # name and summary will be generated later
@@ -606,7 +650,7 @@ def getHierarchy(
                 renamingPrompts = []
                 for _ in range(cfg.nRenameSamples):
                     random.shuffle(parent.children)
-                    renamingPrompts.append(getRenamingHigherLevelClusterPrompt(facet, tokenizer, parent.children[:cfg.maxChildrenForRenaming], tokenizerArgs=cfg.tokenizerArgs))
+                    renamingPrompts.append(getRenamingHigherLevelClusterPrompt(facet, None, parent.children[:cfg.maxChildrenForRenaming], tokenizerArgs=cfg.tokenizerArgs))
                 return renamingPrompts
             
             def processOutputFunc(parent: ConversationCluster, renamePrompts: List[str], renamingOutputs: List[str]):
@@ -638,8 +682,8 @@ def getHierarchy(
     return topLevelParents
 
 def getBaseClusters(
-        facets: List[Facet],
-        llm: LLMInterface,
+        facets: List[FacetMetadata],
+        vertex_model: Any,
         embeddingModel: SentenceTransformer,
         facetValues: List[ConversationFacetData],
         facetValuesEmbeddings: List[Optional[EmbeddingArray]],
@@ -648,11 +692,8 @@ def getBaseClusters(
         dependencyModified: bool,
     ) -> Tuple[List[Optional[FaissKMeans]], List[Optional[List[ConversationCluster]]]]:
     """
-    Gets the base-level clusters for all facets that have shouldMakeFacetClusters(facet) True
-    Returns a list of lists, one list of ConversationCluster for each facet that should make facet clusters True
-    there will be cfg.nBaseClustersFunc(n) number of ConversationClusters in that list
+    Gets the base-level clusters for all facets that have shouldMakeFacetClusters(facet) True.
     """
-    tokenizer = llm.get_tokenizer()
     seed = cfg.seed
     baseClusters = [None] * len(facets)
     for facetI, facet in enumerate(facets):
@@ -662,59 +703,66 @@ def getBaseClusters(
             def getKMeans():
                 cfg.print(f"Running kmeans for facet {facet.name}")
                 kmeans = FaissKMeans(n_clusters=min(n, cfg.nBaseClustersFunc(n)), random_state=cfg.seed, **cfg.kmeansArgs)
-                # we have to normalize for this to be cosine similarity
                 kmeans.fit(preprocessing.normalize(facetEmbeddings))
                 return kmeans.labels_, kmeans.cluster_centers_
 
             (kmeansLabels, kmeansClusterCenters), _ = runIfNotExist(f"basekmeans{facetI}.pkl", getKMeans, dependencyModified)
 
             def getInputsFunc(clusterIndex : int) -> List[str]:
-                # Get points belonging to this cluster
                 clusterPointsIndices = np.where(kmeansLabels == clusterIndex)[0]
                 sampledClusterIndices = np.random.choice(clusterPointsIndices, size=min(cfg.maxPointsToSampleInsideCluster, clusterPointsIndices.shape[0]), replace=False)
-                # Get closest points not in this cluster
                 outsideClusterIndices = np.where(kmeansLabels != clusterIndex)[0]
-                # this is too large (67GB for all of wildchat) to store all ahead of time, so we just compute it individually for each cluster instead
                 distancesToCenter = cdist(facetEmbeddings, kmeansClusterCenters[clusterIndex].reshape(1, -1))[:,0]
                 closestPointsOutsideClusterIndices = outsideClusterIndices[np.argsort(distancesToCenter[kmeansLabels != clusterIndex])]
                 sampledOutsideClusterIndices = closestPointsOutsideClusterIndices[:min(cfg.maxPointsToSampleOutsideCluster, closestPointsOutsideClusterIndices.shape[0])]
 
-                # grab the (deduplicated) facet values
                 clusterFacetValues = sorted(list(set([facetValues[i].facetValues[facetI].value for i in clusterPointsIndices])))
                 clusterOutsideValues = sorted(list(set([facetValues[i].facetValues[facetI].value for i in sampledOutsideClusterIndices])))
-                # generate the cluster name prompt
                 clusterPrompts = []
                 for _ in range(cfg.nNameDescriptionSamplesPerCluster):
-                    # randomize the ordering to avoid positional biases
                     random.shuffle(clusterFacetValues)
                     random.shuffle(clusterOutsideValues)
-                    prompt = getFacetClusterNamePrompt(tokenizer, facet, clusterFacetValues, clusterOutsideValues, tokenizerArgs=cfg.tokenizerArgs)
+                    prompt = getFacetClusterNamePrompt(None, facet, clusterFacetValues, clusterOutsideValues, tokenizerArgs=cfg.tokenizerArgs)
                     clusterPrompts.append(prompt)
                 return clusterPrompts
-            
+
             def processBatchFunc(batchOfPrompts: List[str]) -> List[str]:
                 nonlocal seed
-                seed += 1 # do this so repeated entries get different outputs
-                try:
-                    return llm.generate_batch(batchOfPrompts, **cfg.llmExtraInferenceArgs)
-                except:
-                    with open("badInputs.pkl", "wb") as f:
-                        cloudpickle.dump(batchOfPrompts, f)
-                    raise
-
-            def processOutputFunc(
-                    clusterIndex: int,
-                    clusterPrompts: List[str],
-                    clusterOutputs: List[str]
-                ) -> ConversationCluster:
-                    clusterPointsIndices = np.arange(len(facetEmbeddings))[kmeansLabels == clusterIndex]
-                    summary, name = getMedoidSummaryAndName(clusterOutputs, embeddingModel)
-                    return ConversationCluster(
-                            facet=facet,
-                            summary=summary,
-                            name=name,
-                            indices=clusterPointsIndices,
+                seed += 1
+                results = []
+                for prompt in batchOfPrompts:
+                    try:
+                        response = vertex_model.generate_content(
+                            prompt,
+                            generation_config={
+                                "max_output_tokens": cfg.llmExtraInferenceArgs.get("max_tokens", 1000),
+                                "temperature": cfg.llmExtraInferenceArgs.get("temperature", 0.7),
+                                "top_p": cfg.llmExtraInferenceArgs.get("top_p", 0.8),
+                                "top_k": cfg.llmExtraInferenceArgs.get("top_k", 40),
+                            }
                         )
+                        if hasattr(response, 'text'):
+                            results.append(response.text)
+                        elif hasattr(response, 'candidates') and len(response.candidates) > 0:
+                            results.append(response.candidates[0].content.parts[0].text)
+                        else:
+                            results.append("")
+                    except Exception as e:
+                        cfg.print(f"Error: {e}")
+                        results.append("")
+                    time.sleep(60.0 / 60)
+                return results
+
+            def processOutputFunc(clusterIndex: int, clusterPrompts: List[str], clusterOutputs: List[str]) -> ConversationCluster:
+                clusterPointsIndices = np.arange(len(facetEmbeddings))[kmeansLabels == clusterIndex]
+                summary, name = getMedoidSummaryAndName(clusterOutputs, embeddingModel)
+                return ConversationCluster(
+                    facet=facet,
+                    summary=summary,
+                    name=name,
+                    indices=clusterPointsIndices,
+                )
+
             facetBaseClusters = runBatched(range(len(kmeansClusterCenters)),
                getInputs=getInputsFunc,
                processBatch=processBatchFunc,
@@ -723,18 +771,9 @@ def getBaseClusters(
                verbose=cfg.verbose)
             baseClusters[facetI] = facetBaseClusters
     return baseClusters
-        
-    
-
-    return kMeansFacets, runBatched(list(enumerate(zip(facets, facetValuesEmbeddings))),
-               getInputs=getInputsFunc,
-               processBatch=processBatchFunc,
-               processOutput=processOutputFunc,
-               batchSize=cfg.llmBatchSize,
-               verbose=cfg.verbose)
 
 def getFacetValuesEmbeddings(
-        facets: List[Facet],
+        facets: List[FacetMetadata],
         facetValues: List[ConversationFacetData],
         embeddingModel: SentenceTransformer,
         cfg: OpenClioConfig) -> List[Optional[EmbeddingArray]]:
@@ -774,55 +813,96 @@ def getFacetValuesEmbeddings(
 
 
 def getFacetValues(
-        facets: List[Facet],
-        llm: LLMInterface,
+        facets: List[FacetMetadata],
+        facetSchema: Type[BaseModel],
+        vertex_model: Any,
         data: List[Any],
         cfg: OpenClioConfig
     ) -> List[ConversationFacetData]:
     """
-    Gets facet values for every data point, for each of the facets provided, using the provided llm.
+    Gets ALL facet values for each data point in a single LLM call using structured outputs.
     Returns a list of ConversationFacetData objects, one for each data point.
     """
-    tokenizer = llm.get_tokenizer()
+    facet_field_names = list(facetSchema.model_fields.keys())
 
-    def getInputsFunc(data_point: Any) -> List[str]:
-        # runBatched will automatically flatten these into us for nice batched usage,
-        # then unflatten them back before calling processOutputFunc
-        # so we can send in whatever sort of nested lists we want (though in this case it's only one deep)
-        data_point = cfg.getConversationFunc(data_point) # map it, if needed
+    def getInputsFunc(data_point: Any) -> str:
+        data_point = cfg.getConversationFunc(data_point)
 
         # Truncate text if too long
         if isinstance(data_point, str) and len(data_point) > cfg.maxTextChars:
             data_point = data_point[:cfg.maxTextChars]
 
-        inputs = []
-        for facet in facets:
-            if facet.getFacetPrompt is None:
-                facetInput = getFacetPrompt(tokenizer, facet, data_point, cfg, tokenizerArgs=cfg.tokenizerArgs)
-            else:
-                facetInput = facet.getFacetPrompt(tokenizer, facet, data_point, cfg, tokenizerArgs=cfg.tokenizerArgs)
-            inputs.append(facetInput)
-        return inputs
+        # Create a single prompt that extracts all facets at once
+        prompt = f"""Analyze the following text and extract all requested information:
+
+<text>
+{data_point}
+</text>
+
+Provide your analysis in JSON format according to the schema."""
+        return prompt
+
     seed = cfg.seed
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type((Exception,)),
+    )
     def processBatchFunc(batchOfPrompts: List[str]) -> List[str]:
         nonlocal seed
         seed += 1
-        # Use structured outputs for reliable parsing
-        return llm.generate_batch(batchOfPrompts, response_schema=FacetAnswer, **cfg.llmExtraInferenceArgs)
+        results = []
 
-    def processOutputFunc(data_point: Any, data_point_prompts: List[str], facetOutputs: List[str]) -> ConversationFacetData:
-        facet_values = []
-        for facet, output in zip(facets, facetOutputs):
+        # Convert schema for Vertex AI
+        schema_dict = pydantic_to_vertex_schema(facetSchema)
+
+        for prompt in tqdm(batchOfPrompts, desc="Extracting facets", disable=not cfg.verbose):
             try:
-                # Parse structured JSON output
-                parsed = json.loads(output)
-                value = parsed.get("answer", "").strip()
-            except (json.JSONDecodeError, KeyError):
-                # Fallback to tag extraction for backwards compatibility
-                _, value = extractTagValue(output, "answer")
-                value = value.strip()
+                response = vertex_model.generate_content(
+                    prompt,
+                    generation_config={
+                        "response_mime_type": "application/json",
+                        "response_schema": schema_dict,
+                        "max_output_tokens": cfg.llmExtraInferenceArgs.get("max_tokens", 1000),
+                        "temperature": cfg.llmExtraInferenceArgs.get("temperature", 0.7),
+                        "top_p": cfg.llmExtraInferenceArgs.get("top_p", 0.8),
+                        "top_k": cfg.llmExtraInferenceArgs.get("top_k", 40),
+                    }
+                )
+                if hasattr(response, 'text'):
+                    results.append(response.text)
+                elif hasattr(response, 'candidates') and len(response.candidates) > 0:
+                    results.append(response.candidates[0].content.parts[0].text)
+                else:
+                    raise ValueError(f"Unexpected response format: {response}")
+            except Exception as e:
+                cfg.print(f"Error extracting facets: {e}")
+                # Return empty JSON on error
+                results.append(json.dumps({field: "" for field in facet_field_names}))
 
-            facet_values.append(FacetValue(facet=facet, value=value))
+            # Rate limiting
+            time.sleep(60.0 / 60)  # ~60 requests per minute
+
+        return results
+
+    def processOutputFunc(data_point: Any, data_point_prompt: str, facetOutput: str) -> ConversationFacetData:
+        facet_values = []
+
+        try:
+            # Parse the JSON output containing ALL facets
+            parsed = json.loads(facetOutput)
+
+            # Extract each facet value
+            for facet, field_name in zip(facets, facet_field_names):
+                value = parsed.get(field_name, "").strip()
+                facet_values.append(FacetValue(facet=facet, value=value))
+
+        except (json.JSONDecodeError, KeyError) as e:
+            cfg.print(f"Failed to parse facet output: {e}")
+            # Create empty facet values on error
+            for facet in facets:
+                facet_values.append(FacetValue(facet=facet, value=""))
 
         return ConversationFacetData(
             conversation=data_point,
