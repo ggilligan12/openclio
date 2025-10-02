@@ -51,10 +51,23 @@ class FaissKMeans:
         X = self._as_float32(X)
         n_samples, d = X.shape
 
+        # Set number of OpenMP threads for CPU parallelization
         faiss.omp_set_num_threads(
             faiss.omp_get_max_threads() if self.n_jobs in (-1, None)
             else max(1, self.n_jobs)
         )
+
+        # Try to use GPU if available
+        use_gpu = False
+        gpu_resources = None
+        try:
+            if hasattr(faiss, 'StandardGpuResources'):
+                gpu_resources = faiss.StandardGpuResources()
+                use_gpu = True
+                if self.verbose:
+                    print("Using GPU for FAISS k-means")
+        except:
+            pass
 
         # build kmeans object
         km = faiss.Kmeans(
@@ -65,13 +78,14 @@ class FaissKMeans:
             verbose=bool(self.verbose),
             spherical=True,  # cosine similiarity
             seed=self.random_state,
+            gpu=use_gpu,  # Use GPU if available
         )
         km.cp.min_points_per_centroid = 1 # remove warning
 
         # plug ANN index if requested
         if self.approximate:
-            km.index = self._make_index(d)        
-        
+            km.index = self._make_index(d)
+
         km.train(X)
 
         self.cluster_centers_ = (

@@ -28,24 +28,21 @@ The primary entry point is `runClio()` which orchestrates:
 
 ### Key Components
 
-**openclio/llm_interface.py**: Abstract LLM interface
-- `LLMInterface`: Base class with `generate_batch()` method
-- Supports `response_schema` parameter for structured outputs
+**openclio/openclio.py**: Main pipeline with integrated Vertex AI
+- Uses google-generativeai SDK directly (no separate LLM interface)
+- Gemini models via `genai.GenerativeModel(model_name)`
+- Structured outputs using Pydantic models with `response.parsed`
+- Rate limiting with exponential backoff built into each LLM call
+- Authentication via `genai.configure(project=project_id, location=location)`
 
-**openclio/vertex_llm.py**: Vertex AI implementation
-- Uses Gemini models (Flash or Pro)
-- Handles rate limiting, retries, exponential backoff
-- Authentication via workload identity (Colab) or ADC (local)
-- Structured outputs via `response_schema` parameter
-
-**openclio/structured_outputs.py**: Pydantic models for guaranteed JSON
-- `FacetAnswer`: For facet extraction
-- `ClusterNames`: For cluster naming
-- `DeduplicatedNames`, `ClusterAssignment`, `ClusterRenaming`: For hierarchy building
+**Pydantic models for structured outputs** (defined in openclio.py):
+- `SystemPromptFacets`: Built-in facets for system prompt analysis
+- `ClusterNameAndSummary`: For cluster naming with name + summary
+- All use `response_schema` in config for guaranteed JSON parsing
 
 **openclio/opencliotypes.py**: Core data structures
-- `Facet`: Defines what to extract (question, prefill, summaryCriteria)
-- `OpenClioConfig`: Configuration (batch sizes, hierarchy params, etc.)
+- `FacetMetadata`: Defines facet configuration (name, summaryCriteria)
+- `OpenClioConfig`: Configuration (batch sizes, hierarchy params, rate limits)
 - `OpenClioResults`: Output (facets, clusters, hierarchies, UMAP)
 - **Type aliasing**: `ConversationFacetData` = `DataPointFacetData` (backwards compat)
 
@@ -88,30 +85,51 @@ Legacy conversation format `List[List[Dict]]` still works for backwards compatib
 
 ### Facets
 
-**systemPromptFacets** (default for system prompts):
+**System prompt facets** (built-in):
+OpenClio includes `SystemPromptFacets` Pydantic model and `systemPromptFacetMetadata`:
 - Primary Purpose
 - Domain
 - Key Capabilities
 - Interaction Style
 
-**Custom facets**:
+**Custom facets** (two steps):
+1. Define Pydantic schema:
 ```python
-Facet(
-    name="Security Level",
-    question="What security constraints does this agent have?",
-    prefill="The security constraints are",
-    summaryCriteria="Cluster name should describe security approach"
-)
+from pydantic import BaseModel, Field
+
+class MusicFacets(BaseModel):
+    genre: str = Field(description="The specific genre of music")
+    tone: str = Field(description="The tone (calm, upbeat, aggressive, etc.)")
 ```
 
-**Important**: `summaryCriteria` is required for hierarchy building.
+2. Define metadata (controls which facets get hierarchical clustering):
+```python
+music_metadata = {
+    "genre": FacetMetadata(
+        name="Genre",
+        summaryCriteria="Cluster name should describe the overall genre"
+    ),
+    "tone": FacetMetadata(
+        name="Tone",
+        summaryCriteria="Cluster name should describe the tone"
+    ),
+}
+```
+
+**Important**: Only facets with `summaryCriteria` will get hierarchical clustering. Facets without it are extracted but not clustered.
 
 ## Configuration
 
 ### Common Settings (openclio/opencliotypes.py)
 
+**Rate Limiting** (new in this version):
+- `vertexRateLimitPerMin=30`: Conservative default for Vertex AI (increase if you have higher quota)
+- `maxParallelLLMCalls=5`: Number of parallel API calls (lower = more reliable rate limiting)
+- `minDelayBetweenRequests=0.5`: Minimum delay between requests in seconds
+- Exponential backoff on rate limit errors (2s, 4s, 8s retries)
+
 **Performance**:
-- `llmBatchSize=50`: Lower for Vertex API rate limits (default: 50, was 1000)
+- `llmBatchSize=50`: Lower for Vertex API rate limits (default: 50)
 - `embedBatchSize=1000`: Embedding batch size
 - `maxTextChars=32000`: Truncate long texts (suitable for system prompts)
 
@@ -130,11 +148,13 @@ Facet(
 
 ```python
 results = openclio.runClio(
-    facets=openclio.systemPromptFacets,
-    llm=llm,
+    facetSchema=openclio.SystemPromptFacets,
+    facetMetadata=openclio.systemPromptFacetMetadata,
     embeddingModel=embedding_model,
     data=prompts,
     outputDirectory="./output",
+    project_id="your-gcp-project",
+    model_name="gemini-1.5-flash",  # or gemini-1.5-pro
     displayWidget=True,  # Shows widget
 )
 ```
@@ -179,24 +199,34 @@ Delete specific files to recompute those stages.
 
 ### Structured Outputs
 
-Gemini returns guaranteed JSON matching Pydantic schemas:
+Gemini returns guaranteed JSON matching Pydantic schemas via google-generativeai SDK:
 
 ```python
 # In openclio.py
-llm.generate_batch(prompts, response_schema=FacetAnswer, ...)
-
-# Returns JSON like: {"answer": "Customer support agent"}
+response = vertex_model.generate_content(
+    contents=[prompt],
+    config={
+        "response_mime_type": "application/json",
+        "response_schema": SystemPromptFacets,  # Pass Pydantic class directly
+        "max_output_tokens": 1000,
+        "temperature": 0.7,
+    }
+)
+# Google AI SDK parses and validates for us!
+facet_data = response.parsed  # Already a Pydantic object
 ```
 
-Fallback to tag extraction if JSON parsing fails (backwards compat).
+No manual JSON parsing or XML tag extraction needed - the SDK handles everything.
 
 ### Vertex AI Specifics
 
-- **Auth**: Workload identity in Colab, ADC elsewhere
-- **Rate Limits**: ~60 req/min for Flash, lower for Pro
-- **Models**: `gemini-1.5-flash` (fast), `gemini-1.5-pro` (accurate)
-- **Retries**: Exponential backoff with tenacity
-- **No tokenizer**: Uses character-based truncation instead
+- **Auth**: Uses `genai.configure(project=project_id, location=location)`
+  - In Colab: Automatically uses workload identity
+  - Locally: Uses Application Default Credentials (run `gcloud auth application-default login`)
+- **Rate Limits**: Default 30 req/min (conservative), configurable via `vertexRateLimitPerMin`
+- **Models**: `gemini-1.5-flash` (fast, cheap), `gemini-1.5-pro` (accurate, expensive), `gemini-2.0-flash-exp` (newest)
+- **Retries**: Built-in exponential backoff (2s, 4s, 8s) on rate limit errors (429, quota, rate)
+- **No tokenizer**: Uses character-based truncation (`maxTextChars=32000`)
 
 ### Type System
 
@@ -208,13 +238,21 @@ Keep both old and new names for backwards compatibility:
 ## Common Tasks
 
 ### Add new facet
-1. Create `Facet()` with name, question, prefill, summaryCriteria
-2. Pass to `runClio(facets=[...], ...)`
+1. Define Pydantic schema with Field descriptions
+2. Create metadata dict with `FacetMetadata` for facets you want clustered
+3. Pass both to `runClio(facetSchema=..., facetMetadata=..., ...)`
 
-### Change LLM backend
-1. Implement `LLMInterface` with `generate_batch()` method
-2. Support `response_schema` parameter for structured outputs
-3. Return list of strings (JSON if schema provided)
+Example:
+```python
+class CustomFacets(BaseModel):
+    topic: str = Field(description="Main topic discussed")
+    sentiment: str = Field(description="Overall sentiment (positive/negative/neutral)")
+
+custom_metadata = {
+    "topic": FacetMetadata(name="Topic", summaryCriteria="Cluster by topic"),
+    # sentiment won't be clustered (no entry in metadata)
+}
+```
 
 ### Customize widget
 1. Edit `openclio/widget.py`
@@ -223,18 +261,29 @@ Keep both old and new names for backwards compatibility:
 
 ### Debug facet extraction
 1. Check `facetValues.pkl` in outputDirectory
-2. Look at LLM prompts: `cfg.verbose=True`
-3. Verify JSON parsing: inspect `processOutputFunc` in `getFacetValues()`
+2. Look at LLM prompts and responses: `cfg.verbose=True`
+3. Verify structured output parsing: `response.parsed` should return Pydantic object
+4. Check for rate limit errors in output (will show retry messages)
+
+### Adjust rate limiting
+If getting rate limit errors:
+```python
+cfg = OpenClioConfig(
+    vertexRateLimitPerMin=20,  # Lower if still hitting limits
+    maxParallelLLMCalls=3,     # Reduce parallelism
+    minDelayBetweenRequests=1.0,  # Increase delay
+)
+```
 
 ## Dependencies
 
 Core:
-- `google-cloud-aiplatform`: Vertex AI
-- `pydantic`: Structured outputs
+- `google-generativeai`: Vertex AI via modern SDK (replaces google-cloud-aiplatform)
+- `pydantic`: Structured outputs and schema definitions
 - `sentence-transformers`: Embeddings
 - `ipywidgets`, `plotly`: Interactive widget
-- `umap-learn`, `faiss-cpu`: Clustering/projection
-- `tenacity`: Retry logic
+- `umap-learn`, `faiss-cpu` (or `faiss-gpu`): Clustering/projection
+- Standard library: `threading`, `time` for rate limiting
 
 ## Migration Notes
 
@@ -247,11 +296,39 @@ data = [[{"role": "user", "content": "hi"}], ...]  # conversations
 results = clio.runClio(..., hostWebui=True)
 ```
 
-**New**:
+**New (current version)**:
 ```python
-llm = openclio.VertexLLMInterface(model_name="gemini-1.5-flash", project_id="...")
+from pydantic import BaseModel, Field
+from sentence_transformers import SentenceTransformer
+
+# Define facets as Pydantic schema
+class MyFacets(BaseModel):
+    purpose: str = Field(description="What this does")
+
+# Define metadata
+my_metadata = {
+    "purpose": FacetMetadata(name="Purpose", summaryCriteria="...")
+}
+
+# Run with Vertex AI (no separate LLM object needed)
+embedding_model = SentenceTransformer('all-mpnet-base-v2')
 data = ["You are a helpful assistant...", ...]  # text
-results = openclio.runClio(..., displayWidget=True)
+
+results = openclio.runClio(
+    facetSchema=MyFacets,
+    facetMetadata=my_metadata,
+    embeddingModel=embedding_model,
+    data=data,
+    outputDirectory="./output",
+    project_id="your-gcp-project",
+    model_name="gemini-1.5-flash",
+    displayWidget=True
+)
 ```
 
-Conversations still work but text is primary.
+**Key changes**:
+1. No separate LLM object - Vertex AI integrated directly
+2. Use Pydantic schemas for facets instead of `Facet()` objects
+3. Pass `facetSchema` and `facetMetadata` instead of `facets`
+4. `displayWidget=True` instead of `hostWebui=True`
+5. Conversations still work but text (system prompts) is primary use case

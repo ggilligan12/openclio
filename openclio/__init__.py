@@ -22,16 +22,12 @@ __all__ = [
     # Data types
     'OpenClioConfig',
     'OpenClioResults',
-    'ConversationFacetData',
     'DataPointFacetData',
-    'ConversationCluster',
+    'DataPointEmbedding',
     'DataCluster',
     'FacetValue',
 
     # Widget
     'ClioWidget',
     'test_widget_components',
-
-    # Utilities
-    'getExampleData',
 ]

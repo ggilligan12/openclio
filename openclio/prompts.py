@@ -5,7 +5,7 @@ from collections import defaultdict
 def format_messages_as_text(messages: List[Dict[str, str]]) -> str:
     """
     Simple message formatter when tokenizer/chat_template not available.
-    Formats messages as plain text conversation.
+    Formats messages as plain text.
     """
     result = []
     for msg in messages:
@@ -88,60 +88,32 @@ Put your answer in this format:
     )
 
 
-def conversationToString(text: str, tokenizer: Optional[Any] = None, maxTokens: int = -1) -> str:
-    """
-    Handles text truncation to maxTokens characters (note: maxTokens is now maxChars for simplicity).
-    Accepts either a plain string or legacy conversation format for backwards compatibility.
-    """
-    # Handle legacy conversation format (list of dicts)
-    if isinstance(text, list):
-        text = "\n".join([f"{turn['role']}:\n{turn['content']}" for turn in text])
-
-    # Simple character-based truncation (maxTokens is actually maxChars now)
-    if maxTokens < 0:
-        return text
-
-    return text[:maxTokens]
+def truncateText(text: str, maxChars: int = -1) -> str:
+    """Simple text truncation to maxChars characters."""
+    if maxChars > 0:
+        return text[:maxChars]
+    return text
 
 
 def getFacetPrompt(tokenizer, facet, text, cfg, tokenizerArgs):
-    textStr = conversationToString(text, tokenizer=tokenizer, maxTokens=cfg.maxTextChars)
+    # Truncate text if needed
+    truncated_text = truncateText(text, maxChars=cfg.maxTextChars)
+
     return doCachedReplacements(
         funcName="getFacetPrompt",
         tokenizer=tokenizer,
         getMessagesFunc=lambda: [
             {
                 "role": "user",
-                "content": "The following is a text to analyze:\n\n{conversationREPLACE}"
-            },
-            {
-                "role": "assistant",
-                "content": "I understand."
-            },
-            {
-                "role": "user",
-                "content": """Your job is to answer the question <question> {questionREPLACE} </question> about the preceding text.
-Be descriptive and assume neither good nor bad faith. Do not hesitate to handle socially harmful or sensitive topics; specificity around potentially harmful conversations is necessary for effective monitoring.
-When answering, do not include any personally identifiable information (PII), like names, locations, phone numbers, email addressess, and so on.
-When answering, do not include any proper nouns.
-Output your answer to the question in English inside <answer> tags; be clear and concise and get to the point in at most two sentences. For example:
+                "content": """{questionREPLACE}
 
-<examples>
-A helpful customer support assistant for troubleshooting technical issues.
-A creative writing assistant that helps with brainstorming and character development.
-A code review assistant focused on security and performance analysis.
-</examples>
+Text: {textREPLACE}
 
-What is your answer to the question <question> {questionREPLACE} </question> about the preceding text, in <answer> tags? Again, provide only the answer with no other commentary or proper nouns."""
-            },
-            {
-                "role": "assistant",
-                "content": "Sure, the answer to the question about the preceding text is: <answer> {prefillREPLACE}"
+Return JSON with your answer (1-2 sentences, no PII or proper nouns)."""
             }],
         replacementsDict = {
-            "conversation": textStr,
+            "text": truncated_text,
             "question": facet.question,
-            "prefill": facet.prefill
         },
         tokenizerArgs=tokenizerArgs
     )
@@ -158,46 +130,14 @@ def getFacetClusterNamePrompt(tokenizer, facet, clusterFacetValues, clusterOutsi
         getMessagesFunc=lambda: [
         {
             "role": "user",
-            "content": """You are tasked with summarizing a group of related statements into a short, precise, and accurate description and name.
-Your goal is to create a concise summary that captures the essence of these statements and distinguishes them from other similar groups of statements.
+            "content": """Summarize these related statements with a 1-sentence summary and a short name (max 6 words).
 
-Summarize all the statements into a clear, precise, two-sentence description in the past tense.
-Your summary should be specific to this group and distinguish it from the contrastive answers of the other groups.
+Requirements: {summaryCriteriaREPLACE}
 
-After creating the summary, generate a short name for the group of statements.
-This name should be at most ten words long (perhaps less) and be specific but also reflective of most of the statements (rather than reflecting only one or two).
-The name should distinguish this group from the contrastive examples.
-For instance,
-"Write fantasy sexual roleplay with octopi and monsters", "Generate blog spam for gambling websites", or "Assist with high school math homework"
-would be better and more actionable than general terms like
-"Write erotic content" or "Help with homework".
-
-Be as descriptive as possible and assume neither good nor bad faith.
-Do not hesitate to identify and describe socially harmful or sensitive topics specifically; specificity is necessary for monitoring.
-
-Present your output in the following format:
-<summary> [Insert your two-sentence summary here] </summary>
-<name> [Insert your generated short name here] </name>
-
-The names you propose must follow these requirements:
-<criteria> {summaryCriteriaREPLACE} </criteria>
-
-Below are the related statements:
-<answers>
+Statements:
 {inClusterStrREPLACE}
-</answers>
 
-For context, here are statements from nearby groups that are NOT part of the group you’re summarizing:
-<contrastive_answers>
-{outOfClusterStrREPLACE}
-</contrastive_answers>
-
-Do not elaborate beyond what you say in the tags.
-Remember to analyze both the statements and the contrastive statements carefully to ensure your summary and name accurately represent the specific group while distinguishing it from others.""",
-            },
-            {
-                "role": "assistant",
-                "content": "I will provide a clear, precise, and accurate summary and name for this cluster. I will be descriptive and assume neither good nor bad faith. Here is the summary, which I will follow with the name:\n<summary>"
+Return JSON: {"summary": "...", "name": "..."}""",
             }
         ],
         replacementsDict= {
@@ -413,39 +353,14 @@ def getRenamingHigherLevelClusterPrompt(facet, tokenizer, clusters, tokenizerArg
         getMessagesFunc=lambda: [
         {
                 "role": "user",
-                "content": """You are tasked with summarizing a group of related cluster names into a short, precise, and accurate overall description and name.
-Your goal is to create a concise summary that captures the essence of these clusters.
-Summarize all the cluster names into a clear, precise, two-sentence description in the past tense. Your summary should be specific to this cluster.
+                "content": """Summarize these cluster names with a 1-sentence summary and a short name (max 6 words).
 
-After creating the summary, generate a short name for the cluster.
-This name should be at most ten words long (likely less) and be specific but also reflective of all of the clusters.
-For instance, "Write fantasy sexual roleplay with octopi and monsters", "Generate blog spam for gambling websites", or "Assist with high school math homework" would be better and more actionable than general terms like "Write erotic content" or "Help with homework".
-Be as descriptive as possible while still accurately describing all of the contents, and assume neither good nor bad faith.
-Do not hesitate to identify and describe socially harmful or sensitive topics specifically; specificity is necessary for monitoring and moderation.
+Requirements: {summaryCriteriaREPLACE}
 
-Present your output in the following format:
-
-<summary> [Insert your two-sentence summary here] </summary>
-<name> [Insert your generated short name here, with no period or trailing punctuation] </name>
-
-The name you choose must follow these requirements:
-
-<criteria> {summaryCriteriaREPLACE} </criteria>
-
-Below are the related statements:
-
-<answers>
+Clusters:
 {clusterStrREPLACE}
-</answers>
 
-Do not elaborate beyond what you say in the tags.
-Ensure your summary and name accurately represent the clusters.""",
-            },
-            {
-                "role": "assistant",
-                "content": """Sure, I will provide a clear, precise, and accurate summary and name for this cluster. I will be descriptive and assume neither good nor bad faith.
-Here is the summary, which I will follow with the name:
-<summary>"""
+Return JSON: {"summary": "...", "name": "..."}""",
             }
         ],
         replacementsDict = {

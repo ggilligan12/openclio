@@ -15,7 +15,6 @@ from collections import defaultdict
 from numpy import typing as npt
 import json
 import torch
-import shutil
 import os
 import re
 import random
@@ -25,12 +24,15 @@ import time
 from pydantic import BaseModel, Field, create_model
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import gc
 
 from .prompts import getFacetClusterNamePrompt, getNeighborhoodClusterNamesPrompt, getDeduplicateClusterNamesPrompt, getAssignToHighLevelClusterPrompt, getRenamingHigherLevelClusterPrompt
 from .utils import flatten, unflatten, runBatched, dedup
-from .opencliotypes import FacetMetadata, FacetValue, ConversationFacetData, ConversationEmbedding, ConversationCluster, OpenClioConfig, OpenClioResults, EmbeddingArray, shouldMakeFacetClusters
+from .opencliotypes import FacetMetadata, FacetValue, DataPointFacetData, DataPointEmbedding, DataCluster, OpenClioConfig, OpenClioResults, EmbeddingArray, shouldMakeFacetClusters
 from .faissKMeans import FaissKMeans
-from .writeOutput import convertOutputToWebpage, computeUmap
+from .writeOutput import computeUmap
 
 # System prompt facets as Pydantic model
 class SystemPromptFacets(BaseModel):
@@ -39,6 +41,12 @@ class SystemPromptFacets(BaseModel):
     domain: str = Field(description="The domain or subject area the AI agent operates in (e.g., healthcare, finance, education, etc.). 1-2 sentences.")
     key_capabilities: str = Field(description="The key capabilities or features emphasized. List the most important ones. 1-2 sentences.")
     interaction_style: str = Field(description="The interaction style or personality the AI agent adopts (e.g., professional, casual, empathetic). 1-2 sentences.")
+
+# Pydantic models for structured cluster naming
+class ClusterNameAndSummary(BaseModel):
+    """Structured output for cluster naming"""
+    summary: str = Field(description="A clear, precise, two-sentence description of the cluster")
+    name: str = Field(description="A short, specific name for the cluster (at most 10 words)")
 
 # Metadata for system prompt facets (defines which should have cluster hierarchies)
 systemPromptFacetMetadata = {
@@ -61,40 +69,6 @@ systemPromptFacetMetadata = {
 }
 
 
-# Vertex AI helper functions
-def pydantic_to_vertex_schema(model: Type[BaseModel]) -> Dict[str, Any]:
-    """Convert a Pydantic model to Vertex AI schema format"""
-    schema = model.model_json_schema()
-    properties = {}
-    for field_name, field_info in schema.get("properties", {}).items():
-        field_type = field_info.get("type", "string")
-        vertex_type = {
-            "string": "STRING",
-            "integer": "INTEGER",
-            "number": "NUMBER",
-            "boolean": "BOOLEAN",
-            "array": "ARRAY",
-            "object": "OBJECT"
-        }.get(field_type, "STRING")
-
-        properties[field_name] = {
-            "type": vertex_type,
-            "description": field_info.get("description", "")
-        }
-
-        if field_type == "array" and "items" in field_info:
-            items_type = field_info["items"].get("type", "string")
-            properties[field_name]["items"] = {
-                "type": {"string": "STRING", "integer": "INTEGER", "number": "NUMBER", "boolean": "BOOLEAN"}.get(items_type, "STRING")
-            }
-
-    return {
-        "type": "OBJECT",
-        "properties": properties,
-        "required": schema.get("required", [])
-    }
-
-
 def runClio(
             facetSchema: Type[BaseModel],
             facetMetadata: Dict[str, FacetMetadata],
@@ -104,7 +78,6 @@ def runClio(
             project_id: str,
             model_name: str = "gemini-1.5-flash-002",
             location: str = "us-central1",
-            htmlRoot: str = None,
             displayWidget: bool = False,
             cfg: OpenClioConfig = None,
             **kwargs
@@ -121,7 +94,6 @@ def runClio(
     project_id -- GCP project ID for Vertex AI
     model_name -- Vertex AI model (default: gemini-1.5-flash-002)
     location -- GCP region (default: us-central1)
-    htmlRoot -- (Optional) Web output path
     displayWidget -- (Default: False) Show interactive widget in Jupyter/Colab
     cfg -- Optional OpenClioConfig for advanced settings
 
@@ -144,15 +116,17 @@ def runClio(
     cfg.print = print if cfg.verbose else lambda *a, **b: None
     cfg.kmeansArgs['verbose'] = cfg.verbose
 
-    # Initialize Vertex AI
+    # Initialize Vertex AI client
     try:
-        import vertexai
-        from vertexai.generative_models import GenerativeModel
-        vertexai.init(project=project_id, location=location)
-        vertex_model = GenerativeModel(model_name)
-        cfg.print(f"Initialized Vertex AI with model {model_name}")
+        import google.genai as genai
+        vertex_client = genai.Client(
+            vertexai=True,
+            project=project_id,
+            location=location
+        )
+        cfg.print(f"Initialized Vertex AI client for project {project_id}")
     except ImportError:
-        raise ImportError("Vertex AI dependencies not installed. Install with: pip install google-cloud-aiplatform")
+        raise ImportError("Vertex AI dependencies not installed. Install with: pip install google-genai")
     except Exception as e:
         raise RuntimeError(f"Failed to initialize Vertex AI: {e}")
 
@@ -210,7 +184,8 @@ def runClio(
                 getFacetValues(
                     facets=facets,
                     facetSchema=facetSchema,
-                    vertex_model=vertex_model,
+                    vertex_client=vertex_client,
+                    model_name=model_name,
                     data=data,
                     cfg=cfg
                 ),
@@ -236,7 +211,8 @@ def runClio(
             runIfNotExist("baseClusters.pkl", lambda:
                 getBaseClusters(
                     facets=facets,
-                    vertex_model=vertex_model,
+                    vertex_client=vertex_client,
+                    model_name=model_name,
                     embeddingModel=embeddingModel,
                     facetValues=facetValues,
                     facetValuesEmbeddings=facetValuesEmbeddings,
@@ -253,7 +229,8 @@ def runClio(
             runIfNotExist("rootClusters.pkl", lambda:
                 getHierarchy(
                     facets=facets,
-                    vertex_model=vertex_model,
+                    vertex_client=vertex_client,
+                    model_name=model_name,
                     embeddingModel=embeddingModel,
                     baseClusters=baseClusters,
                     cfg=cfg
@@ -291,7 +268,7 @@ def runClio(
         dependencyModified=dependencyModified
     )
 
-    # Display widget or generate web output
+    # Display widget
     if displayWidget:
         from .widget import ClioWidget
         widget = ClioWidget(output)
@@ -299,40 +276,6 @@ def runClio(
         widget.results = output
         # Return widget - Jupyter will auto-display it (like embedding-atlas does)
         return widget
-    elif htmlRoot is not None:
-        htmlOutputPath = os.path.join(outputDirectory, htmlRoot.strip()[1:] if htmlRoot.strip().startswith("/") else htmlRoot)
-        cfg.print(f"Outputting to webpage at path {htmlOutputPath}")
-        # clear old outputs
-        if not htmlRoot in ["/", ""] and os.path.exists(htmlOutputPath):
-            cfg.print(f"Removing old outputs at {htmlOutputPath}")
-            shutil.rmtree(htmlOutputPath)
-        Path(htmlOutputPath).mkdir(parents=True, exist_ok=True)
-        convertOutputToWebpage(
-            output=output,
-            rootHtmlPath=htmlRoot,
-            targetDir=htmlOutputPath,
-            maxSizePerFile=cfg.htmlMaxSizePerFile,
-            conversationFilter=cfg.htmlConversationFilterFunc,
-            dataToJson=cfg.htmlDataToJsonFunc,
-            verbose=cfg.verbose,
-            password=cfg.password
-        )
-
-        # write redirect page if we are nested, so the webui opens to it nicely
-        if not htmlRoot in ["/", ""]:
-            redirectPage = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta http-equiv="refresh" content="0; url={htmlRoot}">
-</head>
-<body>
-    <p>If you are not redirected, <a href="{htmlRoot}">click here</a></p>
-</body>
-</html>
-            """
-            with open(os.path.join(outputDirectory, "index.html"), "w") as f:
-                f.write(redirectPage)
 
     return output
 
@@ -384,10 +327,11 @@ def getNeighborhoods(
 
 def getHierarchy(
     facets: List[FacetMetadata],
-    vertex_model: Any,
+    vertex_client: Any,
+    model_name: str,
     embeddingModel: SentenceTransformer,
-    baseClusters: List[Optional[List[ConversationCluster]]],
-    cfg: OpenClioConfig) -> List[Optional[List[ConversationCluster]]]:
+    baseClusters: List[Optional[List[DataCluster]]],
+    cfg: OpenClioConfig) -> List[Optional[List[DataCluster]]]:
     """
     Extracts a hierarchy of labels, starting with baseClusters at the lowest level.
     Returns a list one element per facet.
@@ -399,26 +343,156 @@ def getHierarchy(
         seed += 1
         results = []
         for prompt in prompts:
-            try:
-                response = vertex_model.generate_content(
-                    prompt,
-                    generation_config={
-                        "max_output_tokens": cfg.llmExtraInferenceArgs.get("max_tokens", 1000),
-                        "temperature": cfg.llmExtraInferenceArgs.get("temperature", 0.7),
-                        "top_p": cfg.llmExtraInferenceArgs.get("top_p", 0.8),
-                        "top_k": cfg.llmExtraInferenceArgs.get("top_k", 40),
-                    }
-                )
-                if hasattr(response, 'text'):
+            # Enforce minimum delay
+            if len(results) > 0:
+                time.sleep(cfg.minDelayBetweenRequests)
+
+            # Retry with exponential backoff on rate limits
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    response = vertex_client.models.generate_content(
+                        model=model_name,
+                        contents=[prompt],
+                        config={
+                            "max_output_tokens": cfg.llmExtraInferenceArgs.get("max_tokens", 1000),
+                            "temperature": cfg.llmExtraInferenceArgs.get("temperature", 0.7),
+                            "top_p": cfg.llmExtraInferenceArgs.get("top_p", 0.8),
+                            "top_k": cfg.llmExtraInferenceArgs.get("top_k", 40),
+                        }
+                    )
                     results.append(response.text)
-                elif hasattr(response, 'candidates') and len(response.candidates) > 0:
-                    results.append(response.candidates[0].content.parts[0].text)
-                else:
+                    break  # Success, move to next prompt
+
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    # Check if it's a rate limit error
+                    if "429" in error_msg or "quota" in error_msg or "rate" in error_msg:
+                        if attempt < max_retries - 1:
+                            wait_time = (2 ** attempt) * 2  # Exponential backoff: 2s, 4s, 8s
+                            cfg.print(f"Rate limit hit, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                            time.sleep(wait_time)
+                            continue
+                    cfg.print(f"Error in LLM call: {e}")
                     results.append("")
-            except Exception as e:
-                cfg.print(f"Error in LLM call: {e}")
-                results.append("")
-            time.sleep(60.0 / 60)  # Rate limiting
+                    break  # Don't retry non-rate-limit errors
+        return results
+
+    def processBatchFuncLLMWithStructuredNaming(prompts: List[str]) -> List[ClusterNameAndSummary]:
+        """Version of processBatchFuncLLM that uses structured outputs for cluster naming"""
+        nonlocal seed
+        seed += 1
+        results = []
+        for prompt_idx, prompt in enumerate(prompts):
+            # Enforce minimum delay
+            if len(results) > 0:
+                time.sleep(cfg.minDelayBetweenRequests)
+
+            # Retry with exponential backoff on rate limits
+            max_retries = 3
+            success = False
+            for attempt in range(max_retries):
+                try:
+                    # Use structured outputs with Pydantic class
+                    cfg.print(f"Making API call for prompt {prompt_idx + 1} (attempt {attempt + 1}/{max_retries})...")
+
+                    # Log prompt length for debugging
+                    cfg.print(f"Prompt length: {len(prompt)} chars")
+
+                    response = vertex_client.models.generate_content(
+                        model=model_name,
+                        contents=[prompt],
+                        config={
+                            "max_output_tokens": 1024,  # Enough for cluster names without crashes
+                            "temperature": 0.3,  # Lower temperature for more consistent output
+                            "response_mime_type": "application/json",
+                        }
+                    )
+
+                    cfg.print(f"API call successful for prompt {prompt_idx + 1}, parsing response...")
+                    # Check if response has parsed attribute
+                    if hasattr(response, 'parsed') and response.parsed is not None:
+                        cfg.print(f"Response parsed successfully: {response.parsed.name}")
+                        results.append(response.parsed)
+                        success = True
+                        break
+                    else:
+                        # Try getting candidates and parts
+                        cfg.print(f"No parsed attribute, trying candidates...")
+                        import json
+                        try:
+                            # Try to get the full response text from candidates
+                            if hasattr(response, 'candidates') and len(response.candidates) > 0:
+                                candidate = response.candidates[0]
+
+                                # Check finish reason
+                                if hasattr(candidate, 'finish_reason'):
+                                    cfg.print(f"Finish reason: {candidate.finish_reason}")
+
+                                # Check if response was blocked by safety filters
+                                if hasattr(candidate, 'finish_reason') and candidate.finish_reason != 1:  # 1 = STOP (normal completion)
+                                    cfg.print(f"Response did not complete normally. Finish reason code: {candidate.finish_reason}")
+                                    # Return a default result instead of retrying
+                                    results.append(ClusterNameAndSummary(summary="Cluster description", name="Music Genre Cluster"))
+                                    success = True
+                                    break
+
+                                if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
+                                    full_text = ''.join([part.text for part in candidate.content.parts])
+                                    cfg.print(f"Got full text from candidates (length={len(full_text)}): {full_text[:200]}...")
+                                    if len(full_text) > 50:
+                                        cfg.print(f"Full text ends with: ...{full_text[-50:]}")
+                                    json_response = json.loads(full_text)
+                                    parsed = ClusterNameAndSummary(**json_response)
+                                    cfg.print(f"Manual parsing successful: {parsed.name}")
+                                    results.append(parsed)
+                                    success = True
+                                    break
+
+                            # Fallback to response.text
+                            if hasattr(response, 'text'):
+                                cfg.print(f"Trying response.text (len={len(response.text)}): {response.text[:200]}...")
+                                json_response = json.loads(response.text)
+                                parsed = ClusterNameAndSummary(**json_response)
+                                cfg.print(f"Manual parsing successful: {parsed.name}")
+                                results.append(parsed)
+                                success = True
+                                break
+
+                            cfg.print(f"Could not extract text from response. Type: {type(response)}")
+                            results.append(ClusterNameAndSummary(summary="Error in naming", name="Error"))
+                            success = True
+                            break
+                        except json.JSONDecodeError as je:
+                            cfg.print(f"JSON decode error: {je}. Full text: {full_text if 'full_text' in locals() else 'N/A'}")
+                            # If JSON is incomplete, retry this attempt
+                            if attempt < max_retries - 1:
+                                cfg.print(f"Retrying due to malformed JSON...")
+                                time.sleep(2)
+                                continue
+                            results.append(ClusterNameAndSummary(summary="Error in naming", name="Error"))
+                            success = True
+                            break
+
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    cfg.print(f"Exception for prompt {prompt_idx + 1} (attempt {attempt + 1}/{max_retries}): {e}")
+                    # Check if it's a rate limit error
+                    if "429" in error_msg or "quota" in error_msg or "rate" in error_msg:
+                        if attempt < max_retries - 1:
+                            wait_time = (2 ** attempt) * 2  # Exponential backoff: 2s, 4s, 8s
+                            cfg.print(f"Rate limit hit, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                            time.sleep(wait_time)
+                            continue
+                    cfg.print(f"Error in cluster naming for prompt {prompt_idx + 1}: {e}")
+                    results.append(ClusterNameAndSummary(summary="Error in naming", name="Error"))
+                    success = True
+                    break  # Don't retry non-rate-limit errors
+
+            # If all retries failed, add error result
+            if not success:
+                cfg.print(f"All retries exhausted for prompt {prompt_idx}")
+                results.append(ClusterNameAndSummary(summary="Error in naming", name="Error"))
         return results 
     
     topLevelParents = []
@@ -427,7 +501,7 @@ def getHierarchy(
             topLevelParents.append(None)
             continue
 
-        curLevelFacetClusters: List[ConversationCluster] = baseClusters[facetI]
+        curLevelFacetClusters: List[DataCluster] = baseClusters[facetI]
         level = 0
         while len(curLevelFacetClusters) > cfg.minTopLevelSize:
 
@@ -579,7 +653,7 @@ def getHierarchy(
                 for sourceI in sources:
                     baseClusterPotentialHigherLevelClusters[sourceI].append(category)
             
-            def getInputsFunc(facetClusterData: Tuple[ConversationCluster, List[str]]) -> List[str]:
+            def getInputsFunc(facetClusterData: Tuple[DataCluster, List[str]]) -> List[str]:
                 facetCluster, potentialHigherLevelClusters = facetClusterData
                 assignToHigherCategoryPrompts = []
                 for i in range(cfg.nCategorizeSamples):
@@ -588,15 +662,15 @@ def getHierarchy(
                 return assignToHigherCategoryPrompts
 
             # name and summary will be generated later
-            parents: Dict[str, ConversationCluster] = dict(
+            parents: Dict[str, DataCluster] = dict(
                 [
-                    (categoryName.lower().strip(), ConversationCluster(facet=facet, name=categoryName, summary="")) 
+                    (categoryName.lower().strip(), DataCluster(facet=facet, name=categoryName, summary="")) 
                     for (categoryName, categorySources) in dedupedCategories
                 ]
             )
             
             def processOutputFunc(
-                    facetClusterData: Tuple[ConversationCluster, List[str]],
+                    facetClusterData: Tuple[DataCluster, List[str]],
                     assignToHigherCategoryPrompts: List[str],
                     assignToHigherCategoryOutput: List[str]
                 ):
@@ -646,14 +720,14 @@ def getHierarchy(
             #### Rename categories based on which children they were given ####
 
             cfg.print("Renaming categories based on children")
-            def getInputsFunc(parent: ConversationCluster) -> List[str]:
+            def getInputsFunc(parent: DataCluster) -> List[str]:
                 renamingPrompts = []
                 for _ in range(cfg.nRenameSamples):
                     random.shuffle(parent.children)
                     renamingPrompts.append(getRenamingHigherLevelClusterPrompt(facet, None, parent.children[:cfg.maxChildrenForRenaming], tokenizerArgs=cfg.tokenizerArgs))
                 return renamingPrompts
             
-            def processOutputFunc(parent: ConversationCluster, renamePrompts: List[str], renamingOutputs: List[str]):
+            def processOutputFunc(parent: DataCluster, renamePrompts: List[str], renamingOutputs: List[ClusterNameAndSummary]):
                 # if only have one child, just copy name and summary, no need to drift
                 uniqueChildren = set()
                 for child in parent.children:
@@ -669,7 +743,7 @@ def getHierarchy(
         
             runBatched(list(parents.values()),
                 getInputs=getInputsFunc,
-                processBatch=processBatchFuncLLM,
+                processBatch=processBatchFuncLLMWithStructuredNaming,
                 processOutput=processOutputFunc,
                 batchSize=cfg.llmBatchSize,
                 verbose=cfg.verbose)
@@ -683,14 +757,15 @@ def getHierarchy(
 
 def getBaseClusters(
         facets: List[FacetMetadata],
-        vertex_model: Any,
+        vertex_client: Any,
+        model_name: str,
         embeddingModel: SentenceTransformer,
-        facetValues: List[ConversationFacetData],
+        facetValues: List[DataPointFacetData],
         facetValuesEmbeddings: List[Optional[EmbeddingArray]],
         cfg: OpenClioConfig,
         runIfNotExist: Callable[[str, Callable[[], Any], bool], Tuple[Any, bool]],
         dependencyModified: bool,
-    ) -> Tuple[List[Optional[FaissKMeans]], List[Optional[List[ConversationCluster]]]]:
+    ) -> Tuple[List[Optional[FaissKMeans]], List[Optional[List[DataCluster]]]]:
     """
     Gets the base-level clusters for all facets that have shouldMakeFacetClusters(facet) True.
     """
@@ -726,37 +801,147 @@ def getBaseClusters(
                     clusterPrompts.append(prompt)
                 return clusterPrompts
 
-            def processBatchFunc(batchOfPrompts: List[str]) -> List[str]:
+            # Rate limiting with threading
+            rate_limit_lock = threading.Lock()
+            last_request_times = []
+
+            def processBatchFunc(batchOfPrompts: List[str]) -> List[ClusterNameAndSummary]:
                 nonlocal seed
                 seed += 1
+
+                def call_api(prompt: str) -> ClusterNameAndSummary:
+                    # Rate limiting with minimum delay
+                    with rate_limit_lock:
+                        current_time = time.time()
+
+                        # Enforce minimum delay between requests
+                        if len(last_request_times) > 0:
+                            time_since_last = current_time - last_request_times[-1]
+                            if time_since_last < cfg.minDelayBetweenRequests:
+                                time.sleep(cfg.minDelayBetweenRequests - time_since_last)
+                                current_time = time.time()
+
+                        cutoff_time = current_time - 60.0
+                        last_request_times[:] = [t for t in last_request_times if t > cutoff_time]
+
+                        if len(last_request_times) >= cfg.vertexRateLimitPerMin:
+                            sleep_time = last_request_times[0] - cutoff_time + 0.1
+                            time.sleep(sleep_time)
+                            current_time = time.time()
+                            cutoff_time = current_time - 60.0
+                            last_request_times[:] = [t for t in last_request_times if t > cutoff_time]
+
+                        last_request_times.append(current_time)
+
+                    # Retry with exponential backoff on rate limits
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            # Use structured outputs with Pydantic class
+                            cfg.print(f"Making API call (attempt {attempt + 1}/{max_retries})...")
+
+                            # Log prompt length for debugging
+                            cfg.print(f"Prompt length: {len(prompt)} chars")
+
+                            response = vertex_client.models.generate_content(
+                                model=model_name,
+                                contents=[prompt],
+                                config={
+                                    "max_output_tokens": 1024,  # Enough for cluster names without crashes
+                                    "temperature": 0.3,  # Lower temperature for more consistent output
+                                    "response_mime_type": "application/json",
+                                }
+                            )
+
+                            cfg.print(f"API call successful, parsing response...")
+                            # Check if response has parsed attribute
+                            if hasattr(response, 'parsed') and response.parsed is not None:
+                                cfg.print(f"Response parsed successfully: {response.parsed.name}")
+                                return response.parsed
+                            else:
+                                # Try getting candidates and parts
+                                cfg.print(f"No parsed attribute, trying candidates...")
+                                import json
+                                try:
+                                    # Try to get the full response text from candidates
+                                    if hasattr(response, 'candidates') and len(response.candidates) > 0:
+                                        candidate = response.candidates[0]
+
+                                        # Check finish reason
+                                        if hasattr(candidate, 'finish_reason'):
+                                            cfg.print(f"Finish reason: {candidate.finish_reason}")
+
+                                        # Check if response was blocked by safety filters
+                                        if hasattr(candidate, 'finish_reason') and candidate.finish_reason != 1:  # 1 = STOP (normal completion)
+                                            cfg.print(f"Response did not complete normally. Finish reason code: {candidate.finish_reason}")
+                                            # Return a default result instead of retrying
+                                            return ClusterNameAndSummary(summary="Cluster description", name="Music Genre Cluster")
+
+                                        if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
+                                            full_text = ''.join([part.text for part in candidate.content.parts])
+                                            cfg.print(f"Got full text from candidates (length={len(full_text)}): {full_text[:200]}...")
+                                            if len(full_text) > 50:
+                                                cfg.print(f"Full text ends with: ...{full_text[-50:]}")
+                                            json_response = json.loads(full_text)
+                                            parsed = ClusterNameAndSummary(**json_response)
+                                            cfg.print(f"Manual parsing successful: {parsed.name}")
+                                            return parsed
+
+                                    # Fallback to response.text
+                                    if hasattr(response, 'text'):
+                                        cfg.print(f"Trying response.text (len={len(response.text)}): {response.text[:200]}...")
+                                        json_response = json.loads(response.text)
+                                        parsed = ClusterNameAndSummary(**json_response)
+                                        cfg.print(f"Manual parsing successful: {parsed.name}")
+                                        return parsed
+
+                                    cfg.print(f"Could not extract text from response. Type: {type(response)}")
+                                    return ClusterNameAndSummary(summary="Error in naming", name="Error")
+                                except json.JSONDecodeError as je:
+                                    cfg.print(f"JSON decode error: {je}. Full text: {full_text if 'full_text' in locals() else 'N/A'}")
+                                    # If JSON is incomplete, retry this attempt
+                                    if attempt < max_retries - 1:
+                                        cfg.print(f"Retrying due to malformed JSON...")
+                                        time.sleep(2)
+                                        continue
+                                    return ClusterNameAndSummary(summary="Error in naming", name="Error")
+
+                        except Exception as e:
+                            error_msg = str(e).lower()
+                            cfg.print(f"Exception in cluster naming (attempt {attempt + 1}/{max_retries}): {e}")
+                            # Check if it's a rate limit error
+                            if "429" in error_msg or "quota" in error_msg or "rate" in error_msg:
+                                if attempt < max_retries - 1:
+                                    wait_time = (2 ** attempt) * 2  # Exponential backoff: 2s, 4s, 8s
+                                    cfg.print(f"Rate limit hit, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                                    time.sleep(wait_time)
+                                    continue
+                            cfg.print(f"Error in cluster naming: {e}")
+                            return ClusterNameAndSummary(summary="Error in naming", name="Error")
+
+                    # If we get here, all retries failed
+                    cfg.print(f"All retries exhausted for cluster naming")
+                    return ClusterNameAndSummary(summary="Error in naming", name="Error")
+
+                # Since maxParallelLLMCalls=1, just run sequentially to save memory
                 results = []
-                for prompt in batchOfPrompts:
+                for idx, prompt in enumerate(batchOfPrompts):
                     try:
-                        response = vertex_model.generate_content(
-                            prompt,
-                            generation_config={
-                                "max_output_tokens": cfg.llmExtraInferenceArgs.get("max_tokens", 1000),
-                                "temperature": cfg.llmExtraInferenceArgs.get("temperature", 0.7),
-                                "top_p": cfg.llmExtraInferenceArgs.get("top_p", 0.8),
-                                "top_k": cfg.llmExtraInferenceArgs.get("top_k", 40),
-                            }
-                        )
-                        if hasattr(response, 'text'):
-                            results.append(response.text)
-                        elif hasattr(response, 'candidates') and len(response.candidates) > 0:
-                            results.append(response.candidates[0].content.parts[0].text)
-                        else:
-                            results.append("")
+                        result = call_api(prompt)
+                        results.append(result)
+                        cfg.print(f"Completed prompt {idx + 1}/{len(batchOfPrompts)}")
+                        # Force garbage collection after each API call to prevent memory buildup
+                        gc.collect()
                     except Exception as e:
-                        cfg.print(f"Error: {e}")
-                        results.append("")
-                    time.sleep(60.0 / 60)
+                        cfg.print(f"Exception in call_api for prompt {idx}: {e}")
+                        results.append(ClusterNameAndSummary(summary="Error in naming", name="Error"))
+
                 return results
 
-            def processOutputFunc(clusterIndex: int, clusterPrompts: List[str], clusterOutputs: List[str]) -> ConversationCluster:
+            def processOutputFunc(clusterIndex: int, clusterPrompts: List[str], clusterOutputs: List[ClusterNameAndSummary]) -> DataCluster:
                 clusterPointsIndices = np.arange(len(facetEmbeddings))[kmeansLabels == clusterIndex]
                 summary, name = getMedoidSummaryAndName(clusterOutputs, embeddingModel)
-                return ConversationCluster(
+                return DataCluster(
                     facet=facet,
                     summary=summary,
                     name=name,
@@ -770,11 +955,15 @@ def getBaseClusters(
                batchSize=cfg.llmBatchSize,
                verbose=cfg.verbose)
             baseClusters[facetI] = facetBaseClusters
+
+            # Force garbage collection after completing a facet to free memory
+            gc.collect()
+            cfg.print(f"Completed clustering for facet {facet.name}, memory freed")
     return baseClusters
 
 def getFacetValuesEmbeddings(
         facets: List[FacetMetadata],
-        facetValues: List[ConversationFacetData],
+        facetValues: List[DataPointFacetData],
         embeddingModel: SentenceTransformer,
         cfg: OpenClioConfig) -> List[Optional[EmbeddingArray]]:
     """
@@ -782,7 +971,7 @@ def getFacetValuesEmbeddings(
     (this is when the facet has a summaryCriteria that is not None)
     Returns one element for each facet value
     That element will either be None if shouldMakeFacetClusters(facet) is False,
-    or a numpy array of size [numConversations, embeddingDim]
+    or a numpy array of size [numDataPoints, embeddingDim]
     """
     def getInputsFunc(facetI: int) -> List[str]:
         facetInputs = []
@@ -815,18 +1004,19 @@ def getFacetValuesEmbeddings(
 def getFacetValues(
         facets: List[FacetMetadata],
         facetSchema: Type[BaseModel],
-        vertex_model: Any,
+        vertex_client: Any,
+        model_name: str,
         data: List[Any],
         cfg: OpenClioConfig
-    ) -> List[ConversationFacetData]:
+    ) -> List[DataPointFacetData]:
     """
     Gets ALL facet values for each data point in a single LLM call using structured outputs.
-    Returns a list of ConversationFacetData objects, one for each data point.
+    Returns a list of DataPointFacetData objects, one for each data point.
     """
     facet_field_names = list(facetSchema.model_fields.keys())
 
     def getInputsFunc(data_point: Any) -> str:
-        data_point = cfg.getConversationFunc(data_point)
+        data_point = cfg.getDataFunc(data_point)
 
         # Truncate text if too long
         if isinstance(data_point, str) and len(data_point) > cfg.maxTextChars:
@@ -844,67 +1034,107 @@ Provide your analysis in JSON format according to the schema."""
 
     seed = cfg.seed
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type((Exception,)),
-    )
-    def processBatchFunc(batchOfPrompts: List[str]) -> List[str]:
-        nonlocal seed
-        seed += 1
-        results = []
+    # Rate limiting with threading
+    rate_limit_lock = threading.Lock()
+    last_request_times = []
 
-        # Convert schema for Vertex AI
-        schema_dict = pydantic_to_vertex_schema(facetSchema)
+    def rate_limited_call(prompt: str) -> BaseModel:
+        """Make a rate-limited API call - returns parsed Pydantic object"""
+        # Rate limiting: ensure we don't exceed requests per minute
+        with rate_limit_lock:
+            current_time = time.time()
 
-        for prompt in tqdm(batchOfPrompts, desc="Extracting facets", disable=not cfg.verbose):
+            # Enforce minimum delay between requests
+            if len(last_request_times) > 0:
+                time_since_last = current_time - last_request_times[-1]
+                if time_since_last < cfg.minDelayBetweenRequests:
+                    time.sleep(cfg.minDelayBetweenRequests - time_since_last)
+                    current_time = time.time()
+
+            # Remove requests older than 1 minute
+            cutoff_time = current_time - 60.0
+            last_request_times[:] = [t for t in last_request_times if t > cutoff_time]
+
+            # If we're at the limit, wait
+            if len(last_request_times) >= cfg.vertexRateLimitPerMin:
+                sleep_time = last_request_times[0] - cutoff_time + 0.1
+                time.sleep(sleep_time)
+                # Clean up again after sleep
+                current_time = time.time()
+                cutoff_time = current_time - 60.0
+                last_request_times[:] = [t for t in last_request_times if t > cutoff_time]
+
+            last_request_times.append(current_time)
+
+        # Make the actual API call with retry logic
+        max_retries = 3
+        for attempt in range(max_retries):
             try:
-                response = vertex_model.generate_content(
-                    prompt,
-                    generation_config={
+                response = vertex_client.models.generate_content(
+                    model=model_name,
+                    contents=[prompt],
+                    config={
                         "response_mime_type": "application/json",
-                        "response_schema": schema_dict,
+                        "response_schema": facetSchema,
                         "max_output_tokens": cfg.llmExtraInferenceArgs.get("max_tokens", 1000),
                         "temperature": cfg.llmExtraInferenceArgs.get("temperature", 0.7),
                         "top_p": cfg.llmExtraInferenceArgs.get("top_p", 0.8),
                         "top_k": cfg.llmExtraInferenceArgs.get("top_k", 40),
                     }
                 )
-                if hasattr(response, 'text'):
-                    results.append(response.text)
-                elif hasattr(response, 'candidates') and len(response.candidates) > 0:
-                    results.append(response.candidates[0].content.parts[0].text)
-                else:
-                    raise ValueError(f"Unexpected response format: {response}")
+                # SDK parses and validates for us
+                return response.parsed
             except Exception as e:
+                error_msg = str(e).lower()
+                # Check if it's a rate limit error
+                if "429" in error_msg or "quota" in error_msg or "rate" in error_msg:
+                    if attempt < max_retries - 1:
+                        wait_time = (2 ** attempt) * 2  # Exponential backoff: 2s, 4s, 8s
+                        cfg.print(f"Rate limit hit, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                        time.sleep(wait_time)
+                        continue
                 cfg.print(f"Error extracting facets: {e}")
-                # Return empty JSON on error
-                results.append(json.dumps({field: "" for field in facet_field_names}))
+                # Return empty Pydantic object
+                return facetSchema(**{field: "" for field in facet_field_names})
 
-            # Rate limiting
-            time.sleep(60.0 / 60)  # ~60 requests per minute
+    def processBatchFunc(batchOfPrompts: List[str]) -> List[BaseModel]:
+        nonlocal seed
+        seed += 1
+
+        # Parallel API calls with rate limiting
+        results = [None] * len(batchOfPrompts)
+        with ThreadPoolExecutor(max_workers=cfg.maxParallelLLMCalls) as executor:
+            future_to_idx = {
+                executor.submit(rate_limited_call, prompt): idx
+                for idx, prompt in enumerate(batchOfPrompts)
+            }
+
+            with tqdm(total=len(batchOfPrompts), desc="Extracting facets", disable=not cfg.verbose) as pbar:
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    results[idx] = future.result()
+                    pbar.update(1)
 
         return results
 
-    def processOutputFunc(data_point: Any, data_point_prompt: str, facetOutput: str) -> ConversationFacetData:
+    def processOutputFunc(data_point: Any, data_point_prompt: str, facetOutput: BaseModel) -> DataPointFacetData:
         facet_values = []
 
         try:
-            # Parse the JSON output containing ALL facets
-            parsed = json.loads(facetOutput)
-
-            # Extract each facet value
+            # Extract from Pydantic object directly
             for facet, field_name in zip(facets, facet_field_names):
-                value = parsed.get(field_name, "").strip()
-                facet_values.append(FacetValue(facet=facet, value=value))
+                value = getattr(facetOutput, field_name, "")
+                if value is None:
+                    value = ""
+                facet_values.append(FacetValue(facet=facet, value=str(value).strip()))
 
-        except (json.JSONDecodeError, KeyError) as e:
-            cfg.print(f"Failed to parse facet output: {e}")
+        except Exception as e:
+            cfg.print(f"Failed to extract facet values: {e}")
             # Create empty facet values on error
             for facet in facets:
                 facet_values.append(FacetValue(facet=facet, value=""))
 
-        return ConversationFacetData(
+        return DataPointFacetData(
             conversation=data_point,
             facetValues=facet_values
         )
@@ -1112,26 +1342,24 @@ def getCentroidViaEmbeddings(
     sims = cosine_similarity(wow, wow.mean(axis=0).reshape(1, -1)).flatten()
     return values[np.argmax(sims)]
 
-def getMedoidSummaryAndName(outputs: List[str], embeddingModel: SentenceTransformer) -> Tuple[str, str]:
+def getMedoidSummaryAndName(outputs: List[ClusterNameAndSummary], embeddingModel: SentenceTransformer) -> Tuple[str, str]:
     """
     Continuous version of "get most common"
     That gets the embedded value that is closest to all other items (the medoid)
     returns (summary, name)
+    Takes structured ClusterNameAndSummary objects directly from Pydantic validation
     """
-    summaries = []
-    names = []
-    for output in outputs:
-        # re.DOTALL makes . match newlines too (by default it does not)
-        matches = re.findall(r"(.*?)</summary>.*?<name>(.*?)</name>", output, re.DOTALL)
-        if len(matches) > 0:
-            for summary, name in matches:
-                summaries.append(removePunctuation(summary.strip()))
-                names.append(removePunctuation(name.strip()))
-    # remove empty strings
-    summaries = [summary for summary in summaries if len(summary) > 0]
-    names = [name for name in names if len(name) > 0]
-    if len(summaries) == 0: summaries.append("<Could not extract summary>")
-    if len(names) == 0: names.append("<Could not extract name>")
+    # Filter out None values and extract summaries and names from structured objects
+    valid_outputs = [output for output in outputs if output is not None]
+    summaries = [removePunctuation(output.summary.strip()) for output in valid_outputs if output.summary and output.summary.strip()]
+    names = [removePunctuation(output.name.strip()) for output in valid_outputs if output.name and output.name.strip()]
+
+    # Fallback if no valid data
+    if len(summaries) == 0:
+        summaries.append("Unknown cluster")
+    if len(names) == 0:
+        names.append("Unknown")
+
     return getMedoidViaEmbeddings(summaries, embeddingModel), getMedoidViaEmbeddings(names, embeddingModel)
 
 def getMostCommonSummaryAndName(outputs: List[str]) -> Tuple[str, str]:
@@ -1233,7 +1461,7 @@ def cleanTrailingTagsInOutput(output: str) -> str:
 
 
 def printHierarchyHelper(
-    parents: List[ConversationCluster],
+    parents: List[DataCluster],
     indent: str) -> List[str]:
     lines = []
     for parent in parents:
@@ -1242,7 +1470,7 @@ def printHierarchyHelper(
             lines += printHierarchyHelper(parent.children, indent + "  ")
     return lines
 
-def printHierarchy(parents: List[ConversationCluster]):
+def printHierarchy(parents: List[DataCluster]):
     """
     helper function to manually print hierarchy of a specific facet
     """

@@ -23,7 +23,7 @@ python3 --version
 # Install package in development mode
 echo ""
 echo "Installing OpenClio in development mode..."
-pip install -e .
+pip3 install -e .
 
 echo ""
 echo "✓ Installation complete!"

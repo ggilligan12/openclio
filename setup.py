@@ -17,5 +17,5 @@ setuptools.setup(
     ],
     packages = setuptools.find_packages(),
     python_requires = ">=3.6",
-    install_requires = ["concave_hull", "tqdm", "umap-learn", "numba", "dataclasses", "pandas", "sentence_transformers", "numpy", "scikit-learn", "scipy", "torch", "cloudpickle", "setuptools", "pyarrow", "faiss-cpu", "google-cloud-aiplatform>=1.38.0", "tenacity>=8.0.0", "ipywidgets>=8.0.0", "plotly>=5.0.0", "pydantic>=2.0.0"]
+    install_requires = ["concave_hull", "tqdm", "umap-learn", "numba", "dataclasses", "pandas", "sentence_transformers", "numpy", "scikit-learn", "scipy", "torch", "cloudpickle", "setuptools", "pyarrow", "faiss-cpu", "google-genai", "ipywidgets>=8.0.0", "plotly>=5.0.0", "pydantic>=2.0.0"]
 )

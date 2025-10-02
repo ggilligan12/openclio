@@ -3,13 +3,10 @@ import pytz
 from typing import Tuple, List, Dict, Callable, Any
 from sentence_transformers import SentenceTransformer
 import os
-import http.server
-import socketserver
-import pandas as pd
 import itertools
 from collections import deque, defaultdict
 
-from .prompts import conversationToString
+from .prompts import truncateText
 
 # KeyPoller removed - not needed for Vertex AI and incompatible with Jupyter/Colab
 
@@ -20,11 +17,7 @@ from .prompts import conversationToString
 # llm = VertexLLMInterface(model_name="gemini-1.5-flash", project_id="your-project")
 # embedding_model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
 
-def filterDataToEnglish(data : List[List[Dict[str,str]]]) -> List[List[Dict[str,str]]]:
-    """Simple filter function that restricts us to only data that has english on all turns"""
-    return [conversation for conversation in data if all([turn['language'] == 'English' for turn in conversation])]
-
-def dedup(data: List[List[Dict[str, str]]],
+def dedup(data: List[Any],
         dedupKeyFunc: Callable[[Any], Any],
         batchSize: int,
         verbose: bool,
@@ -53,22 +46,6 @@ def dedup(data: List[List[Dict[str, str]]],
         return dedupedConvs, mapping
     else:
         return dedupedConvs
-
-def getExampleData():
-    """Extracts some example data for parsing"""
-    dataPath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wildchatsubset.parquet")
-    subset = pd.read_parquet(dataPath, engine="pyarrow")
-    return [[x for x in subset.iloc[i] if not x is None] for i in range(len(subset))]
-
-def getFullWildchatData(rootPath):
-    """Extracts all wildchat data stored in the given directory (they should look like train-000____.parquet)"""
-    d = []
-    for l in sorted(os.listdir(rootPath))[::-1]: # sort and reverse so reproducable ordering
-        if l.startswith("train-000"):
-            print(l)
-            subset = pd.read_parquet(os.path.join(rootPath, l), engine="pyarrow")
-            d += [subset.iloc[i].conversation for i in range(len(subset))]
-    return filterDataToEnglish(d)
 
 def timestampMillis() -> int:
     """Get current timestamp in millis"""
@@ -273,43 +250,27 @@ def getClosestNames(
 
 
 def getDuplicateFacetValues(
-        facetValues: List['ConversationFacetData'],
+        facetValues: List['DataPointFacetData'],
         facetName: str,
-        conversations: List[Dict[str, str]],
+        dataPoints: List[str],
         llm,  # LLMInterface
         maxTextChars: int
     ):
     """
-    Utility method if u want to find [(facetValue, conversationIndicesOfFacetValue, allDuplicateValues)]
+    Utility method if u want to find [(facetValue, dataPointIndicesOfFacetValue, allDuplicateValues)]
     Helpful for debugging when there's too many duplicates
     """
     counts = defaultdict(lambda: [])
     uniques = defaultdict(lambda: set())
     tokenizer = llm.get_tokenizer()
-    for conversationI, conversationFacetValues in enumerate(facetValues):
-        if conversationI % 1000 == 0: print(conversationI)
-        for facetValue in conversationFacetValues.facetValues:
+    for dataPointI, dataPointFacetValues in enumerate(facetValues):
+        if dataPointI % 1000 == 0: print(dataPointI)
+        for facetValue in dataPointFacetValues.facetValues:
             if facetValue.facet.name == facetName:
-                counts[facetValue.value].append(conversationI)
+                counts[facetValue.value].append(dataPointI)
 
     dups = sorted([(k,vs) for (k,vs) in counts.items() if len(vs) > 1], key=lambda x: -len(x[1]))
     for k,vs in dups:
-        for conversationI in vs:
-            uniques[k].add(conversationToString(conversations[conversationI], tokenizer=tokenizer, maxTokens=maxTextChars))
+        for dataPointI in vs:
+            uniques[k].add(truncateText(dataPoints[dataPointI], maxChars=maxTextChars))
     return [(k,vs,uniques[k]) for (k,vs) in dups]
-
-def runWebui(path, port):
-    """
-    Runs a simple http server at the given path, using the given port
-    Note: Use Ctrl+C to stop the server
-    """
-    class Handler(http.server.SimpleHTTPRequestHandler):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, directory=path, **kwargs)
-    with socketserver.TCPServer(("", port), Handler) as httpd:
-        print(f"Serving at http://localhost:{port}")
-        print("Press Ctrl+C to stop")
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\nServer stopped")

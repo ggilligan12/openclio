@@ -8,7 +8,7 @@ from io import BytesIO
 from typing import List, Optional
 import numpy as np
 
-from .opencliotypes import OpenClioResults, ConversationCluster, shouldMakeFacetClusters
+from .opencliotypes import OpenClioResults, DataCluster, shouldMakeFacetClusters
 
 
 class ClioWidget(anywidget.AnyWidget):
@@ -235,7 +235,7 @@ class ClioWidget(anywidget.AnyWidget):
 
         self._clusters = cluster_list
 
-    def _get_cluster_indices(self, cluster: ConversationCluster) -> np.ndarray:
+    def _get_cluster_indices(self, cluster: DataCluster) -> np.ndarray:
         """Recursively get all indices belonging to a cluster"""
         if cluster.children is None:
             return cluster.indices if cluster.indices is not None else np.array([])

@@ -34,43 +34,34 @@ class FacetValue:
     value: str
 
 @dataclass
-class ConversationFacetData:
-    """Facet data for a single data point (text or conversation)"""
-    conversation: Any  # Can be str (text) or List[Dict] (conversation) for backwards compat
+class DataPointFacetData:
+    """Facet data for a single data point (text)"""
+    data: Any  # Text string
     facetValues: List[FacetValue]
 
-# Alias for clearer naming with text data
-DataPointFacetData = ConversationFacetData
-
 @dataclass
-class ConversationEmbedding:
+class DataPointEmbedding:
     """Embedding for a single data point"""
-    conversation: Any  # Can be str (text) or List[Dict] (conversation)
+    data: Any  # Text string
     embedding: Any
 
-# Alias for clearer naming
-DataPointEmbedding = ConversationEmbedding
-
 @dataclass
-class ConversationCluster:
+class DataCluster:
     """Cluster of data points with similar facet values"""
     facet: FacetMetadata  # Changed from Facet to FacetMetadata
     summary: str
     name: str
-    children: Optional[List['ConversationCluster']] = None
-    parent: Optional['ConversationCluster'] = None
+    children: Optional[List['DataCluster']] = None
+    parent: Optional['DataCluster'] = None
     indices: Optional[np.ndarray] = None
 
     def __hash__(self):
         return hash((self.summary, self.name, self.facet))
 
     def __eq__(self, other):
-        if not isinstance(other, ConversationCluster):
+        if not isinstance(other, DataCluster):
             return False
         return self.summary == other.summary and self.name == other.name and self.facet == other.facet
-
-# Alias for clearer naming
-DataCluster = ConversationCluster
 
 @dataclass
 class OpenClioConfig:
@@ -98,12 +89,19 @@ class OpenClioConfig:
     seed: int = 27 #: Useful so runs are deterministic
     verbose: bool = True #: Whether to print intermediate outputs and progress bars
     llmBatchSize: int = 50 #: Batch size for LLM calls. Lower for API rate limits (Vertex AI), higher for local models
-    embedBatchSize: int = 1000 #: Batch size for embedding. Larger is faster but takes more memory
+    embedBatchSize: int = 100 #: Batch size for embedding. Reduced to 100 to prevent memory issues
     dedupData: bool = True #: Whether to deduplicate the data. Important to avoid large clusters of identical values
-    dedupKeyFunc: Optional[Callable[[Any], Any]] = None #: Function for comparing data equivalence. If None, uses str() for strings or conversationToString for lists
+    dedupKeyFunc: Optional[Callable[[Any], Any]] = None #: Function for comparing data equivalence. If None, uses str() for text comparison
+
+    ### Performance params
+    numWorkers: int = -1 #: Number of worker threads for parallel operations (-1 = all cores)
+    useLowMemoryMode: bool = False #: If True, use less RAM but slower (set False for speed)
+    vertexRateLimitPerMin: int = 15 #: Vertex AI rate limit (requests per minute). Very conservative to avoid crashes. Increase if stable
+    maxParallelLLMCalls: int = 1 #: Maximum number of parallel LLM API calls. Set to 1 for stability, increase if stable
+    minDelayBetweenRequests: float = 2.0 #: Minimum delay (seconds) between API requests. Helps avoid bursts and crashes
 
     ### Generate Base Clusters params
-    getConversationFunc: Callable[[Any], Any] = lambda data: data #: Function to extract text from data point. Identity function by default (data is already text)
+    getDataFunc: Callable[[Any], Any] = lambda data: data #: Function to extract text from data point. Identity function by default (data is already text)
     maxTextChars: int = 32000 #: Max characters per text block. Texts will be truncated to this length to avoid overwhelming model context
     nBaseClustersFunc: Callable[[int], int] = lambda n: n//10 # Number of base clusters to start with, depends on data size. If unspecified, will set to lambda n: n//10
     maxPointsToSampleInsideCluster: int = 10 #: Number of points we sample inside the cluster, when determining base cluster names and summaries. More will make longer contexts but give the llm more information
@@ -144,25 +142,16 @@ class OpenClioConfig:
     })
 
     ### Umap settings
-    conversationToStrFunc: Optional[Callable[[Any], str]] = None #: Function to convert data points into strings to be embedded for 2D umap plot. If None, uses str() for text data
-
-    ### Widget/Website settings
-    htmlMaxSizePerFile: int = 10000000 #: Maximum size per json file for web output (default: 10MB chunks)
-    htmlConversationFilterFunc: Optional[Callable[[Any, ConversationFacetData], bool]] = None #: Optional function to filter which data points are included in output
-    htmlDataToJsonFunc: Optional[Callable[[Any], Dict[str, Any]]] = None #: Optional function to convert data point to JSON for display. If None, wraps text as {"text": "..."}
-
-    ### Deprecated/legacy settings
-    password: Optional[str] = None #: Deprecated - password protection not used in widget mode
-    webuiPort: int = 8421 #: Deprecated - not used in widget mode
+    dataToStrFunc: Optional[Callable[[Any], str]] = None #: Function to convert data points into strings to be embedded for 2D umap plot. If None, uses str() for text data
 
 @dataclass
 class OpenClioResults:
     """Results from running Clio analysis on text data"""
     facets: List[FacetMetadata]  # Changed from List[Facet]
-    facetValues: List[ConversationFacetData]
+    facetValues: List[DataPointFacetData]
     facetValuesEmbeddings: List[Optional[EmbeddingArray]]
-    baseClusters: List[Optional[List[ConversationCluster]]]
-    rootClusters: List[Optional[List[ConversationCluster]]]
-    data: List[Any]  # List of text strings or conversations
+    baseClusters: List[Optional[List[DataCluster]]]
+    rootClusters: List[Optional[List[DataCluster]]]
+    data: List[Any]  # List of text strings
     umap: List[Optional[npt.NDArray[np.float32]]]
     cfg: OpenClioConfig
