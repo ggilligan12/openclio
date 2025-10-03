@@ -71,22 +71,127 @@ class ClioWidget(anywidget.AnyWidget):
             }
         }
 
-        // Update cluster tree
+        // Track expanded state in JavaScript
+        let expandedClusters = new Set();
+
+        // Initialize expanded clusters (all roots expanded by default)
+        function initExpandedState() {
+            const clusters = model.get('_clusters');
+            expandedClusters = new Set();
+            clusters.forEach(cluster => {
+                if (cluster.is_expanded) {
+                    expandedClusters.add(cluster.id);
+                }
+            });
+        }
+
+        // Check if cluster should be visible based on parent's expanded state
+        function isVisible(cluster, clusters) {
+            if (cluster.parent_id === null) return true;  // Root always visible
+            const parent = clusters.find(c => c.id === cluster.parent_id);
+            if (!parent) return true;
+            if (!expandedClusters.has(parent.id)) return false;  // Parent collapsed
+            return isVisible(parent, clusters);  // Check ancestors
+        }
+
+        // Generate tree structure characters
+        function getTreePrefix(cluster, clusters) {
+            if (cluster.depth === 0) return '';
+
+            let prefix = '';
+            let current = cluster;
+
+            // Build prefix from right to left (depth to 1)
+            for (let d = cluster.depth; d > 0; d--) {
+                if (d === cluster.depth) {
+                    // Current level: use ├─ or └─
+                    prefix = (current.is_last_child ? '└─ ' : '├─ ') + prefix;
+                } else {
+                    // Ancestor levels: use │ or space
+                    prefix = (current.is_last_child ? '   ' : '│  ') + prefix;
+                }
+
+                // Move up to parent
+                if (current.parent_id !== null) {
+                    current = clusters.find(c => c.id === current.parent_id);
+                }
+            }
+
+            return prefix;
+        }
+
+        // Toggle cluster expansion
+        function toggleCluster(clusterId) {
+            if (expandedClusters.has(clusterId)) {
+                expandedClusters.delete(clusterId);
+            } else {
+                expandedClusters.add(clusterId);
+            }
+            updateClusters();
+        }
+
+        // Track the last cluster data to detect changes
+        let lastClustersData = null;
+
+        // Update cluster tree with hierarchical rendering
         function updateClusters() {
             const clusters = model.get('_clusters');
-            if (clusters && clusters.length > 0) {
-                clusterTree.innerHTML = clusters.map((cluster, i) =>
-                    `<div style="margin: 5px 0; padding: 5px; cursor: pointer; border: 1px solid #ddd; border-radius: 3px;"
-                          onmouseover="this.style.backgroundColor='#f0f0f0'"
-                          onmouseout="this.style.backgroundColor='white'"
-                          onclick="selectCluster(${i})">
-                        ${cluster.name} (${cluster.count} items)
-                    </div>`
-                ).join('');
-            } else {
+            if (!clusters || clusters.length === 0) {
                 clusterTree.innerHTML = '<p>No clusters available</p>';
+                return;
             }
+
+            // Re-initialize expanded state when clusters change (e.g., switching facets)
+            const clustersData = JSON.stringify(clusters);
+            if (clustersData !== lastClustersData) {
+                initExpandedState();
+                lastClustersData = clustersData;
+            }
+
+            const html = clusters
+                .filter(cluster => isVisible(cluster, clusters))
+                .map((cluster, i) => {
+                    const treePrefix = getTreePrefix(cluster, clusters);
+                    const icon = cluster.is_parent
+                        ? (expandedClusters.has(cluster.id) ? '▼' : '▶')
+                        : '';
+                    const isParent = cluster.is_parent;
+
+                    return `
+                        <div style="
+                            margin: 2px 0;
+                            padding: 4px 8px;
+                            cursor: pointer;
+                            border-radius: 3px;
+                            font-family: 'Courier New', monospace;
+                            font-size: 13px;
+                            ${isParent ? 'font-weight: bold; color: #2c3e50;' : 'color: #7f8c8d;'}
+                        "
+                        onmouseover="this.style.backgroundColor='#f0f0f0'"
+                        onmouseout="this.style.backgroundColor='white'"
+                        onclick="selectCluster(${cluster.id})">
+                            <span style="
+                                display: inline-block;
+                                width: 20px;
+                                text-align: center;
+                                user-select: none;
+                                ${isParent ? 'cursor: pointer;' : ''}
+                            "
+                            onclick="event.stopPropagation(); ${isParent ? `toggleCluster(${cluster.id})` : ''}">
+                                ${icon}
+                            </span>
+                            <span style="color: #95a5a6;">${treePrefix}</span>${cluster.name}
+                            <span style="color: #95a5a6; font-weight: normal;">(${cluster.count})</span>
+                        </div>
+                    `;
+                })
+                .join('');
+
+            clusterTree.innerHTML = html;
         }
+
+        // Make toggleCluster available globally
+        window.toggleCluster = toggleCluster;
 
         // Update text viewer
         function updateTexts() {
@@ -103,9 +208,9 @@ class ClioWidget(anywidget.AnyWidget):
             }
         }
 
-        // Global function for cluster selection
-        window.selectCluster = function(idx) {
-            model.send({ type: 'select_cluster', cluster_idx: idx });
+        // Global function for cluster selection (by ID)
+        window.selectCluster = function(clusterId) {
+            model.send({ type: 'select_cluster', cluster_id: clusterId });
         };
 
         // Event listeners
@@ -165,8 +270,8 @@ class ClioWidget(anywidget.AnyWidget):
         msg_type = content.get('type')
 
         if msg_type == 'select_cluster':
-            cluster_idx = content.get('cluster_idx')
-            self._on_cluster_selected(cluster_idx)
+            cluster_id = content.get('cluster_id')
+            self._on_cluster_selected(cluster_id)
 
     def _update_plot(self):
         """Generate plot as base64-encoded PNG"""
@@ -208,7 +313,7 @@ class ClioWidget(anywidget.AnyWidget):
         plt.close(fig)
 
     def _update_clusters(self):
-        """Update cluster list"""
+        """Update cluster list with hierarchical tree structure"""
         facet_idx = self.selected_facet_idx
         root_clusters = self.results.rootClusters[facet_idx]
 
@@ -216,22 +321,45 @@ class ClioWidget(anywidget.AnyWidget):
             self._clusters = []
             return
 
-        # Flatten cluster hierarchy for simple display
+        # Build hierarchical cluster list with tree metadata
         cluster_list = []
+        cluster_id_counter = [0]  # Use list to allow modification in nested function
 
-        def add_cluster(cluster, depth=0):
+        def add_cluster(cluster, depth=0, parent_id=None, is_last_child=False):
+            """Recursively add clusters with tree structure metadata"""
+            # Generate unique ID
+            cluster_id = cluster_id_counter[0]
+            cluster_id_counter[0] += 1
+
+            # Get all indices for this cluster
             indices = self._get_cluster_indices(cluster)
-            cluster_list.append({
-                'name': '  ' * depth + cluster.name,
-                'count': len(indices),
-                'indices': indices.tolist()
-            })
-            if cluster.children:
-                for child in cluster.children:
-                    add_cluster(child, depth + 1)
 
-        for root_cluster in root_clusters:
-            add_cluster(root_cluster)
+            # Check if this cluster has children
+            has_children = cluster.children is not None and len(cluster.children) > 0
+
+            # Add cluster with full tree metadata
+            cluster_list.append({
+                'id': cluster_id,
+                'name': cluster.name,
+                'count': len(indices),
+                'indices': indices.tolist(),
+                'depth': depth,
+                'is_parent': has_children,
+                'parent_id': parent_id,
+                'is_expanded': depth == 0,  # Roots expanded by default, children collapsed
+                'is_last_child': is_last_child,
+            })
+
+            # Recursively add children
+            if has_children:
+                for i, child in enumerate(cluster.children):
+                    is_last = (i == len(cluster.children) - 1)
+                    add_cluster(child, depth + 1, parent_id=cluster_id, is_last_child=is_last)
+
+        # Add all root clusters
+        for i, root_cluster in enumerate(root_clusters):
+            is_last = (i == len(root_clusters) - 1)
+            add_cluster(root_cluster, depth=0, parent_id=None, is_last_child=is_last)
 
         self._clusters = cluster_list
 
@@ -245,10 +373,16 @@ class ClioWidget(anywidget.AnyWidget):
                 indices.extend(self._get_cluster_indices(child))
             return np.array(indices)
 
-    def _on_cluster_selected(self, cluster_idx):
-        """Handle cluster selection"""
-        if cluster_idx < len(self._clusters):
-            cluster = self._clusters[cluster_idx]
+    def _on_cluster_selected(self, cluster_id):
+        """Handle cluster selection by ID"""
+        # Find cluster by ID
+        cluster = None
+        for c in self._clusters:
+            if c['id'] == cluster_id:
+                cluster = c
+                break
+
+        if cluster is not None:
             self.selected_cluster_indices = np.array(cluster['indices'])
 
             # Update plot with highlighted cluster
