@@ -28,7 +28,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import gc
 
-from .prompts import getFacetClusterNamePrompt, getNeighborhoodClusterNamesPrompt, getDeduplicateClusterNamesPrompt, getAssignToHighLevelClusterPrompt, getRenamingHigherLevelClusterPrompt
+from .prompts import (
+    getFacetClusterNamePrompt,
+    getNeighborhoodClusterNamesPrompt,
+    getDeduplicateClusterNamesPrompt,
+    getAssignToHighLevelClusterPrompt,
+    getRenamingHigherLevelClusterPrompt,
+)
 from .utils import flatten, unflatten, runBatched, dedup
 from .opencliotypes import FacetMetadata, FacetValue, DataPointFacetData, DataPointEmbedding, DataCluster, OpenClioConfig, OpenClioResults, EmbeddingArray, shouldMakeFacetClusters
 from .faissKMeans import FaissKMeans
@@ -70,18 +76,18 @@ systemPromptFacetMetadata = {
 
 
 def runClio(
-            facetSchema: Type[BaseModel],
-            facetMetadata: Dict[str, FacetMetadata],
-            embeddingModel: SentenceTransformer,
-            data: List[str],
-            outputDirectory: str,
-            project_id: str,
-            model_name: str = "gemini-1.5-flash-002",
-            location: str = "us-central1",
-            displayWidget: bool = False,
-            cfg: OpenClioConfig = None,
-            **kwargs
-        ) -> OpenClioResults:
+    facetSchema: Type[BaseModel],
+    facetMetadata: Dict[str, FacetMetadata],
+    embeddingModel: SentenceTransformer,
+    data: List[str],
+    outputDirectory: str,
+    project_id: str,
+    model_name: str = "gemini-1.5-flash-002",
+    location: str = "us-central1",
+    displayWidget: bool = False,
+    cfg: OpenClioConfig = None,
+    **kwargs
+) -> OpenClioResults:
     """
     Runs the Clio algorithm on text data using Vertex AI and embeddings.
 
@@ -135,21 +141,47 @@ def runClio(
     facets = [facetMetadata[field_name] for field_name in facet_field_names]
 
     dependencyModified = False
+    checkpoint_counter = [0]  # Use list to allow modification in nested function
+
     def runIfNotExist(path, runFunc, dependencyModified):
-        fullPath = os.path.join(outputDirectory, path)
-        if os.path.exists(fullPath) and not dependencyModified: # recompute if dependency modified
+        # Add counter prefix for ordering
+        counter_str = f"{checkpoint_counter[0]:04d}"
+        prefixed_path = f"{counter_str}_{path}"
+        fullPath = os.path.join(outputDirectory, prefixed_path)
+
+        # Also check old path without prefix for backward compatibility
+        oldPath = os.path.join(outputDirectory, path)
+
+        # Try to load from prefixed path first, then old path
+        if os.path.exists(fullPath) and not dependencyModified:
             try:
                 cfg.print(f"Resuming from {fullPath}...")
                 with open(fullPath, "rb") as f:
                     result = cloudpickle.load(f)
                 cfg.print(f"Resumed from {fullPath}")
+                checkpoint_counter[0] += 1
                 return result, False
             except:
                 cfg.print(f"Failed to load from path {fullPath}, ignoring")
                 cfg.print(traceback.format_exc())
+        elif os.path.exists(oldPath) and not dependencyModified:
+            try:
+                cfg.print(f"Resuming from old checkpoint {oldPath}...")
+                with open(oldPath, "rb") as f:
+                    result = cloudpickle.load(f)
+                cfg.print(f"Resumed from {oldPath}")
+                checkpoint_counter[0] += 1
+                return result, False
+            except:
+                cfg.print(f"Failed to load from path {oldPath}, ignoring")
+                cfg.print(traceback.format_exc())
+
+        # Run the function and save with prefixed name
         res = runFunc()
         with open(fullPath, "wb") as f:
             cloudpickle.dump(res, f)
+        cfg.print(f"Saved checkpoint: {fullPath}")
+        checkpoint_counter[0] += 1
         return res, True
     
     def getResults():
@@ -246,7 +278,6 @@ def runClio(
                     data=data,
                     facetValuesEmbeddings=facetValuesEmbeddings,
                     embeddingModel=embeddingModel,
-                    tokenizer=None,  # No tokenizer with Vertex AI
                     cfg=cfg
                 ),
                 dependencyModified=dependencyModified
@@ -403,9 +434,10 @@ def getHierarchy(
                         model=model_name,
                         contents=[prompt],
                         config={
-                            "max_output_tokens": 1024,  # Enough for cluster names without crashes
-                            "temperature": 0.3,  # Lower temperature for more consistent output
                             "response_mime_type": "application/json",
+                            "response_schema": ClusterNameAndSummary,
+                            "max_output_tokens": 8192,  # High limit needed for gemini-2.5-flash
+                            "temperature": 0.0,  # Deterministic
                         }
                     )
 
@@ -526,7 +558,7 @@ def getHierarchy(
                 clusterNamePrompts = []
                 for _ in range(2):
                     random.shuffle(clustersInNeighborhood)# shuffle ordering
-                    clusterNamePrompts.append(getNeighborhoodClusterNamesPrompt(facet, None, clustersInNeighborhood, cfg.nDesiredHigherLevelNamesPerClusterFunc(len(clustersInNeighborhood)), tokenizerArgs=cfg.tokenizerArgs))
+                    clusterNamePrompts.append(getNeighborhoodClusterNamesPrompt(facet, clustersInNeighborhood, cfg.nDesiredHigherLevelNamesPerClusterFunc(len(clustersInNeighborhood))))
                 return clusterNamePrompts                    
             
             def processOutputFunc(clusterIndicesInNeighborhood: Sources, clusterNamePrompts: str, clusterNamesOutputs: str) -> List[Tuple[str, Sources]]:
@@ -554,7 +586,7 @@ def getHierarchy(
                 # shuffle ordering
                 while True:
                     random.shuffle(clustersInNeighborhood)
-                    prompt = getNeighborhoodClusterNamesPrompt(facet, None, clustersInNeighborhood, cfg.nDesiredHigherLevelNamesPerClusterFunc(len(clustersInNeighborhood)), tokenizerArgs=cfg.tokenizerArgs)
+                    prompt = getNeighborhoodClusterNamesPrompt(facet, clustersInNeighborhood, cfg.nDesiredHigherLevelNamesPerClusterFunc(len(clustersInNeighborhood)))
                     cfg.print(prompt)
                     nonlocal seed
                     seed += 1
@@ -602,7 +634,7 @@ def getHierarchy(
                 targetAmount =  max(1, len(higherCategoriesInNeighborhood)//2) # aim for -1 (arbitrary), but prompt lets it do more or less as needed
                 if len(higherCategoriesInNeighborhood) == 2:
                     targetAmount = 2 # for only two, it'll mangle the categories if we ask it to dedup them into one, so don't do that
-                return getDeduplicateClusterNamesPrompt(facet, None, higherCategoriesInNeighborhood, targetAmount, tokenizerArgs=cfg.tokenizerArgs)
+                return getDeduplicateClusterNamesPrompt(facet, higherCategoriesInNeighborhood, targetAmount)
             
             def processOutputFunc(
                     higherCategoryIndicesInNeighborhoods: List[Tuple[str, Sources]],
@@ -653,51 +685,41 @@ def getHierarchy(
                 for sourceI in sources:
                     baseClusterPotentialHigherLevelClusters[sourceI].append(category)
             
-            def getInputsFunc(facetClusterData: Tuple[DataCluster, List[str]]) -> List[str]:
+            def getInputsFunc(facetClusterData: Tuple[DataCluster, List[str]]) -> str:
                 facetCluster, potentialHigherLevelClusters = facetClusterData
-                assignToHigherCategoryPrompts = []
-                for i in range(cfg.nCategorizeSamples):
-                    random.shuffle(potentialHigherLevelClusters)
-                    assignToHigherCategoryPrompts.append(getAssignToHighLevelClusterPrompt(None, clusterToAssign=facetCluster, higherLevelClusters=potentialHigherLevelClusters, tokenizerArgs=cfg.tokenizerArgs))
-                return assignToHigherCategoryPrompts
+                # No sampling - just generate one prompt
+                return getAssignToHighLevelClusterPrompt(clusterToAssign=facetCluster, higherLevelClusters=potentialHigherLevelClusters)
 
             # name and summary will be generated later
             parents: Dict[str, DataCluster] = dict(
                 [
-                    (categoryName.lower().strip(), DataCluster(facet=facet, name=categoryName, summary="")) 
+                    (categoryName.lower().strip(), DataCluster(facet=facet, name=categoryName, summary=""))
                     for (categoryName, categorySources) in dedupedCategories
                 ]
             )
-            
+
             def processOutputFunc(
                     facetClusterData: Tuple[DataCluster, List[str]],
-                    assignToHigherCategoryPrompts: List[str],
-                    assignToHigherCategoryOutput: List[str]
+                    assignToHigherCategoryPrompt: str,
+                    assignToHigherCategoryOutput: str
                 ):
                 facetCluster, potentialHigherLevelClusters = facetClusterData
-                assignedClusters = []
-                for output in assignToHigherCategoryOutput:
-                    foundOutput, outputValue = extractTagValue(output, "answer")
-                    # remove cluster and punctuation if it added it
-                    outputValue = removePunctuation(outputValue.replace("<cluster>", "").replace("</cluster>", "").strip()).strip()
-                    if foundOutput:
-                        assignedClusters.append(outputValue)
-                # in the embedding space, find the entry
-                # bestHigherLevelClusterAssignedTo
-                # in potentialHigherLevelClusters that has smallest total distance to all entries of assignedClusters
-                # once we have that, bestAssignedCluster is the entry that has smallest distance to bestHigherLevelClusterAssignedTo
-                # This approach helps us avoid the model slightly renaming things and helps us pick the most representative pair
-                # I invented this idk what they do but this seems the obvious thing to do imo so they probably do this and just didn't say
-                if len(assignedClusters) == 0:
+                # No sampling - just use single output
+                foundOutput, outputValue = extractTagValue(assignToHigherCategoryOutput, "answer")
+                # remove cluster and punctuation if it added it
+                outputValue = removePunctuation(outputValue.replace("<cluster>", "").replace("</cluster>", "").strip()).strip()
+
+                if not foundOutput or not outputValue:
                     # failed to extract cluster from llm, fall back to embedding of the cluster
-                    assignedClusters.append(facetCluster.summary + "\n" + facetCluster.name)
+                    outputValue = facetCluster.summary + "\n" + facetCluster.name
+
                 if len(potentialHigherLevelClusters) == 0:
                     cfg.print("got empty potentialHigherLevelClusters??")
-                    cfg.print(assignedClusters)
+                    cfg.print(outputValue)
                     cfg.print(potentialHigherLevelClusters)
-                # lookup in embedding space the best representative pair
-                # this finds term in potentialHigherLevelClusters that has smallest total distance summed over all assignedClusters
-                bestAssignedCluster, bestHigherLevelClusterAssignedTo = bestRepresentativePair(assignedClusters, potentialHigherLevelClusters, embeddingModel)
+
+                # Find best match in potentialHigherLevelClusters using embeddings
+                bestHigherLevelClusterAssignedTo = bestMatch(outputValue, potentialHigherLevelClusters, embeddingModel)
                 parent = parents[bestHigherLevelClusterAssignedTo.lower().strip()]
                 if parent.children is None:
                     parent.children = []
@@ -720,14 +742,11 @@ def getHierarchy(
             #### Rename categories based on which children they were given ####
 
             cfg.print("Renaming categories based on children")
-            def getInputsFunc(parent: DataCluster) -> List[str]:
-                renamingPrompts = []
-                for _ in range(cfg.nRenameSamples):
-                    random.shuffle(parent.children)
-                    renamingPrompts.append(getRenamingHigherLevelClusterPrompt(facet, None, parent.children[:cfg.maxChildrenForRenaming], tokenizerArgs=cfg.tokenizerArgs))
-                return renamingPrompts
-            
-            def processOutputFunc(parent: DataCluster, renamePrompts: List[str], renamingOutputs: List[ClusterNameAndSummary]):
+            def getInputsFunc(parent: DataCluster) -> str:
+                # No sampling - just use children as-is
+                return getRenamingHigherLevelClusterPrompt(facet, parent.children[:cfg.maxChildrenForRenaming])
+
+            def processOutputFunc(parent: DataCluster, renamePrompt: str, renamingOutput: ClusterNameAndSummary):
                 # if only have one child, just copy name and summary, no need to drift
                 uniqueChildren = set()
                 for child in parent.children:
@@ -737,9 +756,9 @@ def getHierarchy(
                     parent.name = child.name
                     parent.summary = child.summary
                 else:
-                    summary, name = getMedoidSummaryAndName(renamingOutputs, embeddingModel)
-                    parent.summary = summary
-                    parent.name = name
+                    # No sampling - just use the single output directly
+                    parent.summary = renamingOutput.summary
+                    parent.name = renamingOutput.name
         
             runBatched(list(parents.values()),
                 getInputs=getInputsFunc,
@@ -754,6 +773,57 @@ def getHierarchy(
             cfg.print(f"Now have {len(curLevelFacetClusters)} on level {level}")
         topLevelParents.append(curLevelFacetClusters)
     return topLevelParents
+
+def selectOptimalK(
+        embeddings: EmbeddingArray,
+        k_min: int,
+        k_max: int,
+        k_step: int,
+        seed: int,
+        cfg: OpenClioConfig
+    ) -> int:
+    """
+    Select optimal K using Calinski-Harabasz score.
+    Higher CH score = better defined clusters.
+    """
+    from sklearn.metrics import calinski_harabasz_score
+
+    # Normalize embeddings once
+    normalized_embeddings = preprocessing.normalize(embeddings)
+    n = embeddings.shape[0]
+
+    # Clamp search range
+    k_min = max(2, k_min)  # Need at least 2 clusters
+    k_max = min(n - 1, k_max)  # Can't have more clusters than points
+
+    cfg.print(f"Selecting optimal K using Calinski-Harabasz score")
+    cfg.print(f"  Search range: K={k_min} to K={k_max} (step={k_step})")
+
+    best_k = k_min
+    best_score = -np.inf
+    scores = []
+
+    for k in range(k_min, k_max + 1, k_step):
+        if k >= n:
+            break
+
+        # Fit k-means
+        kmeans = FaissKMeans(n_clusters=k, random_state=seed, **cfg.kmeansArgs)
+        kmeans.fit(normalized_embeddings)
+
+        # Compute CH score
+        score = calinski_harabasz_score(embeddings, kmeans.labels_)
+        scores.append((k, score))
+
+        cfg.print(f"  K={k}: CH score={score:.2f}")
+
+        if score > best_score:
+            best_score = score
+            best_k = k
+
+    cfg.print(f"  ✓ Selected K={best_k} (CH score={best_score:.2f})")
+    return best_k
+
 
 def getBaseClusters(
         facets: List[FacetMetadata],
@@ -775,15 +845,35 @@ def getBaseClusters(
         if shouldMakeFacetClusters(facet):
             facetEmbeddings = facetValuesEmbeddings[facetI]
             n = facetEmbeddings.shape[0]
+
+            # Determine K (either auto-select or use function)
+            def selectK():
+                if cfg.autoSelectK:
+                    k_min, k_max = cfg.kSearchRange
+                    return selectOptimalK(
+                        facetEmbeddings,
+                        k_min=k_min,
+                        k_max=k_max,
+                        k_step=cfg.kSearchStep,
+                        seed=cfg.seed,
+                        cfg=cfg
+                    )
+                else:
+                    return cfg.nBaseClustersFunc(n)
+
+            # Cache K selection
+            optimal_k, _ = runIfNotExist(f"optimal_k_facet{facetI}.pkl", selectK, dependencyModified)
+            optimal_k = min(n, optimal_k)  # Sanity check
+
             def getKMeans():
-                cfg.print(f"Running kmeans for facet {facet.name}")
-                kmeans = FaissKMeans(n_clusters=min(n, cfg.nBaseClustersFunc(n)), random_state=cfg.seed, **cfg.kmeansArgs)
+                cfg.print(f"Running kmeans for facet {facet.name} with K={optimal_k}")
+                kmeans = FaissKMeans(n_clusters=optimal_k, random_state=cfg.seed, **cfg.kmeansArgs)
                 kmeans.fit(preprocessing.normalize(facetEmbeddings))
                 return kmeans.labels_, kmeans.cluster_centers_
 
             (kmeansLabels, kmeansClusterCenters), _ = runIfNotExist(f"basekmeans{facetI}.pkl", getKMeans, dependencyModified)
 
-            def getInputsFunc(clusterIndex : int) -> List[str]:
+            def getInputsFunc(clusterIndex : int) -> str:
                 clusterPointsIndices = np.where(kmeansLabels == clusterIndex)[0]
                 sampledClusterIndices = np.random.choice(clusterPointsIndices, size=min(cfg.maxPointsToSampleInsideCluster, clusterPointsIndices.shape[0]), replace=False)
                 outsideClusterIndices = np.where(kmeansLabels != clusterIndex)[0]
@@ -793,13 +883,9 @@ def getBaseClusters(
 
                 clusterFacetValues = sorted(list(set([facetValues[i].facetValues[facetI].value for i in clusterPointsIndices])))
                 clusterOutsideValues = sorted(list(set([facetValues[i].facetValues[facetI].value for i in sampledOutsideClusterIndices])))
-                clusterPrompts = []
-                for _ in range(cfg.nNameDescriptionSamplesPerCluster):
-                    random.shuffle(clusterFacetValues)
-                    random.shuffle(clusterOutsideValues)
-                    prompt = getFacetClusterNamePrompt(None, facet, clusterFacetValues, clusterOutsideValues, tokenizerArgs=cfg.tokenizerArgs)
-                    clusterPrompts.append(prompt)
-                return clusterPrompts
+                # No sampling - just generate one prompt
+                prompt = getFacetClusterNamePrompt(facet, clusterFacetValues, clusterOutsideValues)
+                return prompt
 
             # Rate limiting with threading
             rate_limit_lock = threading.Lock()
@@ -847,9 +933,10 @@ def getBaseClusters(
                                 model=model_name,
                                 contents=[prompt],
                                 config={
-                                    "max_output_tokens": 1024,  # Enough for cluster names without crashes
-                                    "temperature": 0.3,  # Lower temperature for more consistent output
                                     "response_mime_type": "application/json",
+                                    "response_schema": ClusterNameAndSummary,
+                                    "max_output_tokens": 8192,  # High limit needed for gemini-2.5-flash
+                                    "temperature": 0.0,  # Deterministic
                                 }
                             )
 
@@ -938,13 +1025,13 @@ def getBaseClusters(
 
                 return results
 
-            def processOutputFunc(clusterIndex: int, clusterPrompts: List[str], clusterOutputs: List[ClusterNameAndSummary]) -> DataCluster:
+            def processOutputFunc(clusterIndex: int, clusterPrompt: str, clusterOutput: ClusterNameAndSummary) -> DataCluster:
                 clusterPointsIndices = np.arange(len(facetEmbeddings))[kmeansLabels == clusterIndex]
-                summary, name = getMedoidSummaryAndName(clusterOutputs, embeddingModel)
+                # No sampling - just use the single output directly
                 return DataCluster(
                     facet=facet,
-                    summary=summary,
-                    name=name,
+                    summary=clusterOutput.summary,
+                    name=clusterOutput.name,
                     indices=clusterPointsIndices,
                 )
 
@@ -1135,7 +1222,7 @@ Provide your analysis in JSON format according to the schema."""
                 facet_values.append(FacetValue(facet=facet, value=""))
 
         return DataPointFacetData(
-            conversation=data_point,
+            data=data_point,
             facetValues=facet_values
         )
 
@@ -1262,6 +1349,32 @@ def setSeed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
+
+def bestMatch(
+    query: str,
+    candidates: List[str],
+    model: SentenceTransformer
+) -> str:
+    """
+    Find the best matching candidate for a query string using cosine similarity.
+    Returns the candidate with highest similarity to query.
+    """
+    if len(candidates) == 0:
+        raise ValueError("candidates must be non-empty")
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # Encode query and candidates
+    queryEmb = preprocessing.normalize(model.encode([query], convert_to_numpy=True, show_progress_bar=False))
+    candidatesEmb = preprocessing.normalize(model.encode(candidates, convert_to_numpy=True, show_progress_bar=False))
+
+    # Compute cosine similarity
+    similarities = cosine_similarity(queryEmb, candidatesEmb)[0]
+
+    # Return candidate with highest similarity
+    best_idx = np.argmax(similarities)
+    return candidates[best_idx]
+
 
 def bestRepresentativePair(
     A: List[str],

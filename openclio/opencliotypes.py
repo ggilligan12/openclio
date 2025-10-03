@@ -39,6 +39,9 @@ class DataPointFacetData:
     data: Any  # Text string
     facetValues: List[FacetValue]
 
+# Backwards compatibility alias for old pickle files
+ConversationFacetData = DataPointFacetData
+
 @dataclass
 class DataPointEmbedding:
     """Embedding for a single data point"""
@@ -62,6 +65,9 @@ class DataCluster:
         if not isinstance(other, DataCluster):
             return False
         return self.summary == other.summary and self.name == other.name and self.facet == other.facet
+
+# Backwards compatibility alias for old pickle files
+ConversationCluster = DataCluster
 
 @dataclass
 class OpenClioConfig:
@@ -104,9 +110,11 @@ class OpenClioConfig:
     getDataFunc: Callable[[Any], Any] = lambda data: data #: Function to extract text from data point. Identity function by default (data is already text)
     maxTextChars: int = 32000 #: Max characters per text block. Texts will be truncated to this length to avoid overwhelming model context
     nBaseClustersFunc: Callable[[int], int] = lambda n: n//10 # Number of base clusters to start with, depends on data size. If unspecified, will set to lambda n: n//10
+    autoSelectK: bool = False #: If True, automatically select optimal K using Calinski-Harabasz score instead of nBaseClustersFunc
+    kSearchRange: Tuple[int, int] = (5, 50) #: Range of K values to try when autoSelectK=True. Format: (min_k, max_k)
+    kSearchStep: int = 1 #: Step size when searching K range (e.g., step=5 tries K=5,10,15,...)
     maxPointsToSampleInsideCluster: int = 10 #: Number of points we sample inside the cluster, when determining base cluster names and summaries. More will make longer contexts but give the llm more information
     maxPointsToSampleOutsideCluster: int = 10 #: Number of points we sample outside the cluster (as examples of stuff closest to, but *not* in the cluster), when determining base cluster names and summaries. More will make longer contexts but give the llm more information
-    nNameDescriptionSamplesPerCluster: int = 5 #: How many times to sample a cluster's name and description. We sample multiple times and take the most frequent answer, so higher values here help avoid any noise from data ordering (but takes longer)
 
     ### Hierarchy params
     minTopLevelSize: int = 5 #: Once we've reached this many or less clusters, we have reached the top, stop going higher
@@ -116,17 +124,11 @@ class OpenClioConfig:
     # get names from neighborhoods
     nDesiredHigherLevelNamesPerClusterFunc: Callable[[int], int] = lambda n: max(1, n//3) #: Given number of elements in our neighborhood, return how many higher level cluster names we should have. The default of lambda n: max(1, n//3) will result in there being rougly half the amount of cluster names at each level in the hierarchy.
     # dedup (none)
-    # assign lower level to higher level categories 
-    nCategorizeSamples: int = 5 #: How many times to resample assignments of cluster to higher level categories. The most common sample is chosen. More samples will take longer but help decrease noise from ordering of members of this category
+    # assign lower level to higher level categories - no sampling, just call once
     # rename once we see what's in the categories
     maxChildrenForRenaming: int = 10 #: Maximum number of children in category to display when deciding what to name it, more will make longer prompt but give more accurate classification
-    nRenameSamples: int = 5 #: How many times to resample the new name and description that we sample, once the children are assigned to a cluster. More samples will take longer but help decrease noise from ordering of children
 
     ### Extra Params
-    tokenizerArgs: Dict[str, Any] = field(default_factory=lambda: {
-        "enable_thinking": False # don't need thinking for the simple things we are doing, also without this we lose prompt prefix (I think?)
-    }) #: Extra parameters to pass into our tokenizer when caling apply_chat_template
-
     llmExtraInferenceArgs: Dict[str, Any] = field(default_factory=lambda: {
         "max_tokens": 1000,
          # default qwen non-thinking sampling params

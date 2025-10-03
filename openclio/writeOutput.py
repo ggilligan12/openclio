@@ -18,7 +18,7 @@ def computeUmapHelper(embeddingArr: EmbeddingArray, verbose: bool = False):
     )
     return umapModel.fit_transform(embeddingArr)
 
-def computeUmap(data: List[Any], facetValuesEmbeddings: List[Optional[EmbeddingArray]], embeddingModel: SentenceTransformer, tokenizer: Optional[Any], cfg: OpenClioConfig):
+def computeUmap(data: List[Any], facetValuesEmbeddings: List[Optional[EmbeddingArray]], embeddingModel: SentenceTransformer, cfg: OpenClioConfig):
     cfg.print("Running umap on facet values")
     resUmaps = [(computeUmapHelper(embeddingArr, verbose=cfg.verbose) if embeddingArr is not None else None) for embeddingArr in facetValuesEmbeddings]
     cfg.print("Embedding data for umap")
