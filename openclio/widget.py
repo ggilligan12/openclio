@@ -305,7 +305,7 @@ class ClioWidget(anywidget.AnyWidget):
 
         # Convert to base64
         buf = BytesIO()
-        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
         buf.seek(0)
         img_base64 = base64.b64encode(buf.read()).decode('utf-8')
         self._plot_data = f"data:image/png;base64,{img_base64}"

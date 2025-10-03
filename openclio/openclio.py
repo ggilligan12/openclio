@@ -1010,18 +1010,39 @@ def getBaseClusters(
                     cfg.print(f"All retries exhausted for cluster naming")
                     return ClusterNameAndSummary(summary="Error in naming", name="Error")
 
-                # Since maxParallelLLMCalls=1, just run sequentially to save memory
-                results = []
-                for idx, prompt in enumerate(batchOfPrompts):
-                    try:
-                        result = call_api(prompt)
-                        results.append(result)
-                        cfg.print(f"Completed prompt {idx + 1}/{len(batchOfPrompts)}")
-                        # Force garbage collection after each API call to prevent memory buildup
+                # Parallel API calls with rate limiting (like getFacetValues does)
+                results = [None] * len(batchOfPrompts)
+
+                if cfg.maxParallelLLMCalls <= 1:
+                    # Sequential processing for maxParallelLLMCalls=1
+                    for idx, prompt in enumerate(batchOfPrompts):
+                        try:
+                            result = call_api(prompt)
+                            results[idx] = result
+                            cfg.print(f"Completed prompt {idx + 1}/{len(batchOfPrompts)}")
+                            gc.collect()
+                        except Exception as e:
+                            cfg.print(f"Exception in call_api for prompt {idx}: {e}")
+                            results[idx] = ClusterNameAndSummary(summary="Error in naming", name="Error")
+                else:
+                    # Parallel processing for maxParallelLLMCalls > 1
+                    with ThreadPoolExecutor(max_workers=cfg.maxParallelLLMCalls) as executor:
+                        future_to_idx = {
+                            executor.submit(call_api, prompt): idx
+                            for idx, prompt in enumerate(batchOfPrompts)
+                        }
+
+                        with tqdm(total=len(batchOfPrompts), desc="Naming clusters", disable=not cfg.verbose) as pbar:
+                            for future in as_completed(future_to_idx):
+                                idx = future_to_idx[future]
+                                try:
+                                    results[idx] = future.result()
+                                except Exception as e:
+                                    cfg.print(f"Exception in call_api for prompt {idx}: {e}")
+                                    results[idx] = ClusterNameAndSummary(summary="Error in naming", name="Error")
+                                pbar.update(1)
+
                         gc.collect()
-                    except Exception as e:
-                        cfg.print(f"Exception in call_api for prompt {idx}: {e}")
-                        results.append(ClusterNameAndSummary(summary="Error in naming", name="Error"))
 
                 return results
 
